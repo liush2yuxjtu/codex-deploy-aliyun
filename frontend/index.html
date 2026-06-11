@@ -184,6 +184,24 @@
   }
   .composer button.send:disabled { background: #4a4a4a; color: #2a2a2a; cursor: not-allowed; }
   .composer button.send svg { width: 18px; height: 18px; }
+  .composer .timeout-pick {
+    flex-shrink: 0;
+    height: 32px;
+    background-color: var(--bg-sidebar);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0 26px 0 10px;
+    font: inherit; font-size: 12px;
+    cursor: pointer;
+    appearance: none; -webkit-appearance: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%238e8e8e' stroke-width='2'><path d='M6 9l6 6 6-6'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    align-self: flex-end; margin-bottom: 2px;
+  }
+  .composer .timeout-pick:hover { color: var(--text); border-color: #444; }
+  .composer .timeout-pick:focus { outline: none; border-color: var(--accent); }
   .composer-hint { max-width: 768px; margin: 6px auto 0; text-align: center; font-size: 11px; color: var(--text-faint); }
   .mode-tabs {
     max-width: 768px; margin: 0 auto 8px;
@@ -359,6 +377,12 @@
     </div>
     <form class="composer" onsubmit="event.preventDefault(); sendMessage();">
       <textarea id="input" placeholder="问 Codex(每条消息独立沙箱)…" rows="1" onkeydown="handleKey(event)" oninput="autoSize(this); toggleSend()"></textarea>
+      <select id="timeoutSec" class="timeout-pick" title="本次调用的最大等待时间">
+        <option value="60">60s</option>
+        <option value="120" selected>120s</option>
+        <option value="300">300s</option>
+        <option value="600">600s</option>
+      </select>
       <button type="submit" class="send" id="send-btn" disabled>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
       </button>
@@ -648,9 +672,24 @@ function appendTurn(t) {
       meta.className = 'turn-meta';
       if (t.pending) {
         const jobBadge = t.async ? `<span class="badge" title="异步任务,可在 /job/${t.jobId} 查看">↻ ${t.jobState || 'pending'}</span>` : '';
-        meta.innerHTML = jobBadge
-          + '<span class="badge live pending-elapsed">⏱ 0.0s</span>'
-          + '<span class="badge cancel" onclick="cancelRun()">✕ 取消</span>';
+        // For cancelled async jobs, replace the live "⏱ N.Ns" timer with a static label.
+        const elapsedBadge = t.cancelled
+          ? '<span class="badge">✕ 已取消</span>'
+          : '<span class="badge live pending-elapsed">⏱ 0.0s</span>';
+        // Cancel button: ONLY on async jobs that are still in flight.
+        // - hidden for sync runs (no jobId to cancel)
+        // - hidden once cancelled (server confirmed)
+        // - hidden once a terminal state has fired (done/error/cancelled)
+        const terminalStates = { done: 1, error: 1, cancelled: 1 };
+        const showCancel = t.async && t.jobId && !t.cancelled && !terminalStates[t.jobState];
+        const cancelBadge = showCancel
+          ? '<span class="badge cancel" data-cancel-job="' + escapeHtml(t.jobId) + '">✕ 取消</span>'
+          : '';
+        meta.innerHTML = jobBadge + elapsedBadge + cancelBadge;
+        if (showCancel) {
+          const btn = meta.querySelector('.badge.cancel');
+          if (btn) btn.addEventListener('click', () => cancelAsyncJob(t.jobId, btn, t));
+        }
       } else if (t.isHistory) {
         // keep meta compact for history — banner already carries the key fields
         const sandboxBadge = t.runId ? `<span class="badge sandbox">sandbox ${t.runId.slice(0,8)}</span>` : '';
@@ -738,11 +777,22 @@ function setMode(mode) {
   document.body.classList.toggle('pdf-mode', mode === 'pdf');
   document.getElementById('chat-mode-tab').classList.toggle('active', mode === 'chat');
   document.getElementById('pdf-mode-tab').classList.toggle('active', mode === 'pdf');
+  // PDF / long-running skill calls need a larger default ceiling; chat stays
+  // at 120s so short prompts surface errors fast.
+  const pick = document.getElementById('timeoutSec');
+  if (pick) pick.value = mode === 'pdf' ? '300' : '120';
   document.getElementById('composer-hint').innerHTML =
     mode === 'pdf'
       ? 'PDF 模式会把 URL 或 .md/.html 文件交给后端 web-first PDF 工作流。'
       : "每条消息会触发后端 <code style=\"font-family:'JetBrains Mono',monospace;color:#b4b4b4;\">codex exec</code>,跑在新创建的沙箱内。";
   if (mode === 'chat') document.getElementById('input').focus();
+}
+
+function readTimeoutSec() {
+  const el = document.getElementById('timeoutSec');
+  if (!el) return 120;
+  const v = parseInt(el.value, 10);
+  return Number.isFinite(v) && v > 0 ? v : 120;
 }
 
 function autoSize(ta) { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'; }
@@ -891,6 +941,80 @@ function filenameFromHeaders(response) {
 let activeController = null;
 function cancelRun() { if (activeController) { try { activeController.abort(); } catch {} } }
 
+// ISSUE-002: Cancel an in-flight async job.
+// POST /job/:id/cancel — defensive against 404 (route not yet wired) and
+// 409 (job already finished) so the UI never shows a hard error.
+// When the cancel returns 200 we mark the turn as `cancelled` and stop
+// the live timer; the EventSource 'cancelled' event will close the SSE
+// stream and the existing `done` / `error` handler will re-render.
+async function cancelAsyncJob(jobId, btn, turn) {
+  if (!jobId || !cfg.endpoint) return;
+  if (btn) {
+    btn.style.pointerEvents = 'none';
+    btn.style.opacity = '0.55';
+    btn.textContent = '✕ 取消中…';
+  }
+  if (turn) {
+    turn.cancelling = true;
+    turn.cancelledAt = performance.now();
+  }
+  const url = cfg.endpoint + '/job/' + encodeURIComponent(jobId) + '/cancel'
+    + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
+  try {
+    const r = await fetch(url, { method: 'POST' });
+    if (r.status === 404) {
+      // ISSUE-005 (killJobTree) hasn't landed yet — backend route is missing.
+      // Hide the button, don't error. UI is forward-compatible: when the
+      // route ships, the same code path works as-is.
+      if (turn) {
+        turn.cancelled = true;
+        turn.cancelling = false;
+        turn.cancelNote = '后端 cancel 路由尚未就绪(ISSUE-005)';
+        renderChat();
+      }
+      return;
+    }
+    if (r.status === 409) {
+      // Server says the job is already in a terminal state — silently
+      // flip the card to `done` so the UI matches reality. The SSE
+      // `done`/`error` event will fire the rich payload shortly.
+      if (turn) {
+        turn.jobState = 'done';
+        turn.cancelling = false;
+        renderChat();
+      }
+      return;
+    }
+    if (!r.ok) {
+      // Unexpected failure — restore the button so the user can retry.
+      if (btn) {
+        btn.style.pointerEvents = '';
+        btn.style.opacity = '';
+        btn.textContent = '✕ 取消';
+      }
+      if (turn) turn.cancelling = false;
+      return;
+    }
+    // 200 — server accepted the cancel. The SSE `cancelled` event will
+    // close the stream and update the turn with exit details. We pre-mark
+    // the local state so the user sees immediate feedback.
+    if (turn) {
+      turn.cancelled = true;
+      turn.cancelling = false;
+      renderChat();
+    }
+  } catch (e) {
+    // Network error — keep the card live, the user can retry. The
+    // server-side timeout will eventually reap the job either way.
+    if (btn) {
+      btn.style.pointerEvents = '';
+      btn.style.opacity = '';
+      btn.textContent = '✕ 取消';
+    }
+    if (turn) turn.cancelling = false;
+  }
+}
+
 async function sendMessage() {
   const ta = document.getElementById('input');
   const prompt = ta.value.trim();
@@ -946,7 +1070,7 @@ async function sendMessage() {
       const r = await fetch(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}), timeoutSec: 120 }),
+        body: JSON.stringify({ prompt, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}), timeoutSec: readTimeoutSec() }),
         signal: controller.signal,
       });
       const j = await r.json();
@@ -975,7 +1099,7 @@ async function sendAsync(prompt, controller, assistantTurn, t0) {
   const initResp = await fetch(submitUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ prompt, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}), timeoutSec: 240 }),
+    body: JSON.stringify({ prompt, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}), timeoutSec: readTimeoutSec() }),
     signal: controller.signal,
   });
   if (!initResp.ok) {
