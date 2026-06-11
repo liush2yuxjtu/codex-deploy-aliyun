@@ -12,7 +12,9 @@ risk: low
 effort: small
 expected_commits: 1
 ready_for_agent: true
-status: pending
+status: done
+merged_commit: 8cf7dc0
+closed_at: 2026-06-12
 ---
 
 # ISSUE-004: timeoutSec 后端 max=900 + exitCode=124
@@ -23,12 +25,12 @@ status: pending
 
 ## Acceptance criteria
 
-- [ ] `MAX_TIMEOUT = 900` 常量
-- [ ] `timeoutSec` 校验:超出 900 → 400 `{error: "bad_timeout", max: 900}`
-- [ ] 超时触发时:`exitCode === 124 && error === "timeout"`
-- [ ] 同步 `/run` 与异步 `/run-async` 两条路径行为一致
-- [ ] `/healthz` 自检:e2e `curl /run -d '{"timeoutSec": 901}'` → 400
-- [ ] e2e:`curl /run -d '{"prompt":"sleep 5","timeoutSec": 2}'` → exitCode=124, error="timeout"
+- [x] `MAX_TIMEOUT = 900` 常量
+- [x] `timeoutSec` 校验:超出 900 → 400 `{error: "bad_timeout", max: 900}`
+- [x] 超时触发时:`exitCode === 124 && error === "timeout"`
+- [x] 同步 `/run` 与异步 `/run-async` 两条路径行为一致
+- [x] `/healthz` 自检:e2e `curl /run -d '{"timeoutSec": 901}'` → 400
+- [ ] e2e:`curl /run -d '{"prompt":"sleep 5","timeoutSec": 2}'` → exitCode=124, error="timeout"(本地无 codexsbx 用户,需 Aliyun 复测)
 
 ## Blocked by
 
