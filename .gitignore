@@ -34,3 +34,7 @@ workspace/**/*.pdf.png
 *.bak
 server.js.bak.*
 secret.env
+
+# Credential rotation backups — written by scripts/rotate_credentials.sh
+# (never commit; outside the repo by default but listed for safety)
+~/.credentials.bak/
