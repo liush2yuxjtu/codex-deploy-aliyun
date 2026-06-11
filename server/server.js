@@ -178,6 +178,28 @@ function parseMultipart(req, boundary) {
   });
 }
 
+// Map skill/IO errors to one-line client-safe messages. Full stderr stays in journalctl.
+function sanitizePdfError(err, kind) {
+  const msg = String(err && err.message || err || '');
+  console.error('[pdf:' + kind + ']', msg);  // full detail server-side
+  if (/SSL_ERROR_SYSCALL|SSL_connect|certificate|ECONN|ENOTFOUND|getaddrinfo/i.test(msg)) {
+    return '源 URL 网络失败(ssl/dns/连接)。请检查 URL 是否可访问。';
+  }
+  if (/HTTP\s*4\d\d|HTTP\s*5\d\d|404|403/i.test(msg)) {
+    return '源 URL 返回 4xx/5xx。请确认链接有效。';
+  }
+  if (/timed?\s*out|timed out after|TimeoutExpired|SIGKILL/i.test(msg)) {
+    return 'PDF 生成超时(超过 3 分钟)。请尝试更小的输入或稍后重试。';
+  }
+  if (/not produced at/i.test(msg)) {
+    return 'PDF 技能未产出文件。可能是输入格式不被支持或源页面脚本渲染失败。';
+  }
+  if (/exited\s+\d+/i.test(msg)) {
+    return 'PDF 技能内部失败(详细日志已记录到服务端)。';
+  }
+  return 'PDF 生成失败(详细日志已记录到服务端)。';
+}
+
 async function runPdfScript(inputPath, slug) {
   fs.mkdirSync(PDF_OUTPUT_DIR, { recursive: true });
   const cwd = path.dirname(PDF_SCRIPT);
@@ -220,7 +242,7 @@ async function handlePdfUrl(req, res) {
     });
     return res.end(pdf);
   } catch (e) {
-    return json(res, 500, { ok: false, error: String(e && e.message || e) });
+    return json(res, 500, { ok: false, error: sanitizePdfError(e, 'url') });
   }
 }
 
@@ -231,8 +253,15 @@ async function handlePdfUpload(req, res) {
   const boundary = m[1] || m[2];
   if (!fs.existsSync(PDF_SCRIPT)) return json(res, 503, { ok: false, error: 'md-to-pdf-webfirst skill not installed at ' + PDF_SKILL_DIR });
   const parts = await parseMultipart(req, boundary);
-  const file = parts.file || parts.upload || Object.values(parts).find(p => p && p.filename);
-  if (!file || !file.filename) return json(res, 400, { ok: false, error: 'no file in upload' });
+  // Only accept the canonical field names. If the form had any file but not
+  // under "file" / "upload", tell the user the right field name.
+  const file = parts.file || parts.upload;
+  if (!file || !file.filename) {
+    const fields = Object.keys(parts);
+    const hasAnyFile = fields.some(k => parts[k] && parts[k].filename);
+    if (hasAnyFile) return json(res, 400, { ok: false, error: '表单字段名必须是 "file"(或 "upload"),收到的是: ' + fields.filter(k => parts[k] && parts[k].filename).join(', ') });
+    return json(res, 400, { ok: false, error: 'no file in upload' });
+  }
   const ext = path.extname(file.filename).toLowerCase() || '.html';
   if (!['.md', '.markdown', '.html', '.htm'].includes(ext)) {
     return json(res, 400, { ok: false, error: 'unsupported file type: ' + ext + ' (allowed: .md .markdown .html .htm)' });
@@ -253,7 +282,7 @@ async function handlePdfUpload(req, res) {
     });
     return res.end(pdf);
   } catch (e) {
-    return json(res, 500, { ok: false, error: String(e && e.message || e) });
+    return json(res, 500, { ok: false, error: sanitizePdfError(e, 'upload') });
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}
   }
