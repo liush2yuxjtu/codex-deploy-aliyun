@@ -1,0 +1,119 @@
+#!/bin/bash
+set -e
+
+echo "=== 1. patch server.js: stdio ignore stdin + serve static frontend ==="
+python3 <<'PY'
+import pathlib, re
+p = pathlib.Path('/opt/codex-api/server.js')
+src = p.read_text()
+
+# --- A. stdio ignore stdin so codex doesn't hang waiting for input ---
+old_block = """    const child = spawn(CODEX_BIN, codexArgs, {
+    uid: SANDBOX_UID,
+    gid: SANDBOX_GID,
+    cwd: workDir,
+    detached: true,
+    env: {"""
+new_block = """    const child = spawn(CODEX_BIN, codexArgs, {
+    uid: SANDBOX_UID,
+    gid: SANDBOX_GID,
+    cwd: workDir,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {"""
+assert old_block in src, 'stdio block not found'
+src = src.replace(old_block, new_block, 1)
+
+# --- B. static frontend serving ---
+# inject route handler ABOVE the 404 fallback. Find:
+old_404 = """  json(res, 404, { ok: false, error: 'not found' });
+});"""
+new_404 = """  // ─── static frontend ───
+  if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
+    try {
+      const fs = require('fs');
+      const html = fs.readFileSync('/opt/codex-api/public/index.html', 'utf8');
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(html),
+        'Cache-Control': 'no-store',
+      });
+      return res.end(html);
+    } catch (e) {
+      return json(res, 500, { ok: false, error: 'frontend not deployed: ' + e.message });
+    }
+  }
+
+  json(res, 404, { ok: false, error: 'not found' });
+});"""
+# the existing "/" handler returns plain text — replace it to delegate to static
+old_plain_root = """  if (req.method === 'GET' && url.pathname === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end(
+      'codex-api online\\n\\n' +
+      'POST /run   body={ prompt, apiKey, model?, timeoutSec? }\\n' +
+      'GET  /healthz\\n\\n' +
+      'example:\\n' +
+      '  curl -sS http://HOST:3030/run \\\\\\n' +
+      "    -H 'content-type: application/json' \\\\\\n" +
+      "    -d '{\\"prompt\\":\\"write hello world in python\\",\\"apiKey\\":\\"sk-...\\"}'\\n"
+    );
+  }"""
+new_plain_root = """  // GET / now served by static frontend block below; keep /v1info as the plain-text doc.
+  if (req.method === 'GET' && url.pathname === '/v1info') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end(
+      'codex-api online\\n\\n' +
+      'POST /run   body={ prompt, apiKey, model?, timeoutSec? }\\n' +
+      'GET  /healthz\\n' +
+      'GET  /         (frontend)\\n'
+    );
+  }"""
+if old_plain_root in src:
+    src = src.replace(old_plain_root, new_plain_root, 1)
+else:
+    print('WARN: plain root not found, leaving as-is')
+
+assert old_404 in src, 'route fallback not found'
+src = src.replace(old_404, new_404, 1)
+
+p.write_text(src)
+print('patched, len=', len(src))
+PY
+
+echo ""
+echo "=== 2. decode + place frontend ==="
+mkdir -p /opt/codex-api/public
+base64 -d > /opt/codex-api/public/index.html <<'B64HERE'
+__B64_PLACEHOLDER__
+B64HERE
+ls -la /opt/codex-api/public/
+head -3 /opt/codex-api/public/index.html
+
+echo ""
+echo "=== 3. restart + verify ==="
+systemctl restart codex-api.service
+sleep 2
+systemctl is-active codex-api.service
+journalctl -u codex-api.service -n 5 --no-pager
+
+echo ""
+echo "=== 4. local smoke tests ==="
+echo "--- GET /healthz ---"
+curl -sS http://127.0.0.1:3030/healthz; echo
+echo "--- GET / (first 5 lines of html) ---"
+curl -sS http://127.0.0.1:3030/ | head -5
+echo "--- POST /run with bogus key, short timeout ---"
+time curl -sS http://127.0.0.1:3030/run \
+  -H 'content-type: application/json' \
+  --max-time 25 \
+  -d '{"prompt":"say hi","apiKey":"sk-test-invalid","timeoutSec":15}' | head -c 1000
+echo
+
+echo ""
+echo "=== 5. orphan check ==="
+sleep 2
+ps -eo pid,user,etimes,cmd | grep -E 'codex' | grep -v grep | grep -v 'server.js' || echo "(no codex orphans)"
+
+echo ""
+echo "=== DONE step F ==="

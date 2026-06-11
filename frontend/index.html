@@ -1,0 +1,969 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Codex Chat — sandboxed</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #212121;
+    --bg-sidebar: #181818;
+    --bg-input: #303030;
+    --bg-hover: #2f2f2f;
+    --bg-assistant: transparent;
+    --bg-user: #303030;
+    --text: #ececec;
+    --text-dim: #b4b4b4;
+    --text-faint: #8e8e8e;
+    --border: #2f2f2f;
+    --accent: #19c37d;
+    --danger: #ef4146;
+    --warn: #f5a524;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; overflow: hidden; }
+  body { display: grid; grid-template-columns: 260px 1fr; }
+
+  /* ---- sidebar ---- */
+  aside {
+    background: var(--bg-sidebar);
+    border-right: 1px solid var(--border);
+    padding: 12px 8px;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+  .new-chat {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px; border-radius: 8px;
+    color: var(--text); cursor: pointer; font-size: 14px;
+    background: transparent; border: none; width: 100%; text-align: left;
+  }
+  .new-chat:hover { background: var(--bg-hover); }
+  .new-chat svg { width: 16px; height: 16px; }
+  .sidebar-section { color: var(--text-faint); font-size: 12px; padding: 16px 12px 6px; font-weight: 500; letter-spacing: 0.02em; }
+  .convo-item {
+    display: block;
+    padding: 8px 12px; margin: 1px 0;
+    border-radius: 8px; font-size: 14px;
+    color: var(--text-dim); cursor: pointer;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .convo-item:hover { background: var(--bg-hover); color: var(--text); }
+  .convo-item.active { background: var(--bg-hover); color: var(--text); }
+  .sidebar-spacer { flex: 1; }
+  .settings-btn {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px; border-radius: 8px;
+    background: transparent; border: none; color: var(--text-dim);
+    cursor: pointer; font-size: 13px; width: 100%; text-align: left;
+  }
+  .settings-btn:hover { background: var(--bg-hover); color: var(--text); }
+
+  /* ---- main ---- */
+  main { display: flex; flex-direction: column; min-height: 0; }
+  header {
+    padding: 12px 20px; display: flex; align-items: center; gap: 12px;
+    border-bottom: 1px solid transparent;
+  }
+  .model-picker {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 16px; font-weight: 600; color: var(--text);
+    cursor: pointer; padding: 6px 10px; border-radius: 8px;
+    background: transparent; border: none;
+  }
+  .model-picker:hover { background: var(--bg-hover); }
+  .model-picker .chev { color: var(--text-faint); }
+  .endpoint-pill {
+    margin-left: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; color: var(--text-faint);
+    padding: 4px 10px; border-radius: 999px;
+    background: var(--bg-sidebar); border: 1px solid var(--border);
+  }
+  .endpoint-pill .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 6px; vertical-align: 1px; }
+  .endpoint-pill.offline .dot { background: var(--danger); }
+  .endpoint-pill.checking .dot { background: var(--warn); }
+
+  /* ---- chat scroll area ---- */
+  .chat-scroll { flex: 1; overflow-y: auto; padding: 0 0 140px; }
+  .turns { max-width: 768px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---- empty state ---- */
+  .empty {
+    min-height: calc(100vh - 220px);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; padding: 24px;
+  }
+  .empty h1 { font-size: 30px; font-weight: 500; margin-bottom: 32px; letter-spacing: -0.01em; }
+  .suggestions { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; max-width: 720px; width: 100%; }
+  .suggestion {
+    padding: 16px; border: 1px solid var(--border); border-radius: 12px;
+    cursor: pointer; text-align: left; background: transparent;
+    color: var(--text); font-size: 14px; font-family: inherit;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .suggestion:hover { border-color: #444; background: rgba(255,255,255,0.02); }
+  .suggestion .title { font-weight: 500; margin-bottom: 4px; }
+  .suggestion .sub { color: var(--text-faint); font-size: 13px; }
+
+  /* ---- turns ---- */
+  .turn { padding: 18px 0; }
+  .turn.user .bubble {
+    margin-left: auto;
+    max-width: 70%;
+    background: var(--bg-user);
+    padding: 12px 18px;
+    border-radius: 22px;
+    font-size: 15px; line-height: 1.55;
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  .turn.assistant .bubble {
+    max-width: 100%;
+    font-size: 15px; line-height: 1.6;
+  }
+  .turn.user { display: flex; justify-content: flex-end; }
+  .turn-meta {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; color: var(--text-faint);
+    margin-top: 8px; display: flex; gap: 12px; flex-wrap: wrap;
+  }
+  .turn-meta .badge { padding: 2px 8px; border-radius: 4px; background: var(--bg-sidebar); border: 1px solid var(--border); }
+  .turn-meta .badge.ok { color: var(--accent); border-color: rgba(25,195,125,0.3); }
+  .turn-meta .badge.err { color: var(--danger); border-color: rgba(239,65,70,0.3); }
+  .turn-meta .badge.sandbox { color: #a78bfa; border-color: rgba(167,139,250,0.3); }
+  .turn-meta .badge.live { color: var(--warn); border-color: rgba(229,192,123,0.3); }
+  .turn-meta .badge.live::before { content: '●'; margin-right: 4px; animation: pulse 1.2s ease-in-out infinite; }
+  .turn-meta .badge.cancel { cursor: pointer; color: var(--danger); border-color: rgba(239,65,70,0.3); }
+  .turn-meta .badge.cancel:hover { background: rgba(239,65,70,0.12); }
+  .turn-meta .badge.quota { color: #e5c07b; border-color: rgba(229,192,123,0.5); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  pre.code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px; line-height: 1.55;
+    background: #0d0d0d; padding: 14px 16px;
+    border-radius: 10px; border: 1px solid var(--border);
+    overflow-x: auto; color: #e5e5e5; white-space: pre-wrap;
+    margin-top: 8px;
+  }
+  pre.code.stderr { color: var(--text-dim); background: #1a0e0e; border-color: rgba(239,65,70,0.2); }
+  .typing { display: inline-block; }
+  .typing span { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); margin: 0 2px; animation: blink 1.4s infinite both; }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: 0.2; } 40% { opacity: 1; } }
+
+  /* ---- composer ---- */
+  .composer-wrap {
+    position: absolute; bottom: 0; left: 260px; right: 0;
+    padding: 12px 24px 18px;
+    background: linear-gradient(to bottom, transparent, var(--bg) 40%);
+  }
+  .composer {
+    max-width: 768px; margin: 0 auto;
+    background: var(--bg-input);
+    border-radius: 28px;
+    padding: 12px 14px 12px 18px;
+    display: flex; align-items: flex-end; gap: 8px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+  }
+  .composer textarea {
+    flex: 1; background: transparent; border: none; outline: none;
+    color: var(--text); font-family: inherit; font-size: 15px; line-height: 1.5;
+    resize: none; max-height: 200px; min-height: 24px; padding: 6px 0;
+  }
+  .composer button.send {
+    width: 36px; height: 36px; border-radius: 50%;
+    background: var(--text); color: var(--bg);
+    border: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .composer button.send:disabled { background: #4a4a4a; color: #2a2a2a; cursor: not-allowed; }
+  .composer button.send svg { width: 18px; height: 18px; }
+  .composer-hint { max-width: 768px; margin: 6px auto 0; text-align: center; font-size: 11px; color: var(--text-faint); }
+  .mode-tabs {
+    max-width: 768px; margin: 0 auto 8px;
+    display: flex; gap: 6px; align-items: center;
+  }
+  .mode-tab {
+    border: 1px solid var(--border); background: rgba(255,255,255,0.03);
+    color: var(--text-dim); border-radius: 999px;
+    padding: 6px 10px; font: inherit; font-size: 12px;
+    cursor: pointer;
+  }
+  .mode-tab.active { color: var(--text); border-color: rgba(25,195,125,0.45); background: rgba(25,195,125,0.12); }
+  .pdf-panel {
+    max-width: 768px; margin: 0 auto 8px;
+    display: none; gap: 8px; align-items: stretch;
+  }
+  body.pdf-mode .pdf-panel { display: grid; grid-template-columns: 1fr 168px; }
+  body.pdf-mode .composer { display: none; }
+  .pdf-url-row {
+    display: flex; gap: 8px; align-items: center;
+    min-width: 0; background: var(--bg-input);
+    border: 1px solid var(--border); border-radius: 14px;
+    padding: 8px 10px 8px 14px;
+  }
+  .pdf-url-row input {
+    min-width: 0; flex: 1; border: none; outline: none;
+    background: transparent; color: var(--text); font: inherit; font-size: 14px;
+  }
+  .pdf-url-row input::placeholder { color: var(--text-faint); }
+  .pdf-action {
+    border: none; border-radius: 10px; padding: 8px 12px;
+    background: var(--text); color: var(--bg); cursor: pointer;
+    font: inherit; font-size: 13px; font-weight: 600;
+    white-space: nowrap;
+  }
+  .pdf-action:disabled { background: #4a4a4a; color: #2a2a2a; cursor: not-allowed; }
+  .pdf-drop {
+    border: 1px dashed #555; border-radius: 14px;
+    background: rgba(255,255,255,0.03); color: var(--text-dim);
+    display: flex; flex-direction: column; justify-content: center;
+    min-height: 52px; padding: 8px 10px; cursor: pointer;
+    transition: border-color .15s, background .15s, color .15s;
+  }
+  .pdf-drop strong { color: var(--text); font-size: 13px; font-weight: 600; }
+  .pdf-drop span { margin-top: 2px; font-size: 11px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pdf-drop.dragging { border-color: var(--accent); background: rgba(25,195,125,0.12); color: var(--text); }
+  .pdf-status {
+    max-width: 768px; margin: 4px auto 0;
+    font-size: 12px; color: var(--text-faint); min-height: 16px;
+  }
+  .pdf-card {
+    border: 1px solid var(--border); border-radius: 12px;
+    background: rgba(255,255,255,0.025); overflow: hidden;
+  }
+  .pdf-card-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 12px 14px; border-bottom: 1px solid var(--border);
+  }
+  .pdf-card-title { min-width: 0; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pdf-card-actions { display: flex; gap: 8px; flex-shrink: 0; }
+  .pdf-card-actions a {
+    color: var(--text); text-decoration: none;
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 9px; font-size: 12px;
+  }
+  .pdf-card-actions a.primary { background: var(--text); color: var(--bg); border-color: var(--text); font-weight: 600; }
+  .pdf-preview {
+    width: 100%; height: min(58vh, 520px);
+    border: 0; background: #111;
+  }
+  .pdf-meta { padding: 10px 14px; color: var(--text-faint); font-size: 12px; }
+  @media (max-width: 700px) {
+    body { grid-template-columns: 1fr; }
+    aside { display: none; }
+    .composer-wrap { left: 0; }
+    .suggestions { grid-template-columns: 1fr; }
+    body.pdf-mode .pdf-panel { grid-template-columns: 1fr; }
+    .pdf-preview { height: 56vh; }
+  }
+
+  /* ---- settings modal ---- */
+  .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.65); display: none; align-items: center; justify-content: center; z-index: 50; }
+  .modal-bg.open { display: flex; }
+  .modal {
+    background: #2f2f2f; border-radius: 16px; padding: 24px;
+    width: 480px; max-width: 90vw;
+    border: 1px solid var(--border);
+  }
+  .modal h2 { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
+  .modal p.sub { color: var(--text-dim); font-size: 13px; margin-bottom: 20px; }
+  .field { margin-bottom: 16px; }
+  .field label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 6px; }
+  .field input {
+    width: 100%; padding: 10px 12px; background: #1f1f1f;
+    border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 13px;
+    outline: none;
+  }
+  .field input:focus { border-color: var(--accent); }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+  .btn { padding: 8px 16px; border-radius: 8px; border: none; cursor: pointer; font-size: 14px; font-weight: 500; font-family: inherit; }
+  .btn.primary { background: var(--text); color: var(--bg); }
+  .btn.ghost { background: transparent; color: var(--text-dim); }
+  .btn.ghost:hover { color: var(--text); background: var(--bg-hover); }
+</style>
+</head>
+<body>
+
+<aside>
+  <button class="new-chat" onclick="newChat()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+    新建会话
+  </button>
+  <div class="sidebar-section">今日</div>
+  <div id="convo-list"></div>
+  <div class="sidebar-spacer"></div>
+  <button class="settings-btn" onclick="openSettings()">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    设置 (API key, 端点)
+  </button>
+</aside>
+
+<main>
+  <header>
+    <button class="model-picker">
+      Codex <span style="color:#8e8e8e;font-weight:400;">(gpt-5.5)</span>
+      <svg class="chev" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <span id="endpoint-pill" class="endpoint-pill checking"><span class="dot"></span><span id="endpoint-text">checking…</span></span>
+  </header>
+
+  <div class="chat-scroll" id="scroll">
+    <div class="turns" id="turns">
+      <div class="empty" id="empty">
+        <h1>问点什么吧</h1>
+        <div class="suggestions">
+          <button class="suggestion" onclick="useSuggestion(this)">
+            <div class="title">用 Python 写一个倒序输出字符串的函数</div>
+            <div class="sub">含一个 unit test</div>
+          </button>
+          <button class="suggestion" onclick="useSuggestion(this)">
+            <div class="title">列出 Linux 中 5 个常用的文本处理工具</div>
+            <div class="sub">每个一句话说明</div>
+          </button>
+          <button class="suggestion" onclick="usePdfSuggestion()">
+            <div class="title">把 Markdown / HTML 变成 PDF</div>
+            <div class="sub">支持 URL 或拖入文件</div>
+          </button>
+          <button class="suggestion" onclick="useSuggestion(this)">
+            <div class="title">解释什么是 Linux namespace</div>
+            <div class="sub">面向非工程师,300 字以内</div>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="composer-wrap">
+    <div class="mode-tabs" role="tablist" aria-label="输入模式">
+      <button class="mode-tab active" id="chat-mode-tab" type="button" onclick="setMode('chat')">聊天</button>
+      <button class="mode-tab" id="pdf-mode-tab" type="button" onclick="setMode('pdf')">PDF</button>
+    </div>
+    <div class="pdf-panel" id="pdf-panel">
+      <div class="pdf-url-row">
+        <input id="pdf-url" type="url" placeholder="粘贴 Markdown / HTML URL" oninput="togglePdfUrl()" onkeydown="handlePdfUrlKey(event)" />
+        <button class="pdf-action" id="pdf-url-btn" type="button" onclick="submitPdfUrl()" disabled>生成 PDF</button>
+      </div>
+      <div class="pdf-drop" id="pdf-drop" onclick="document.getElementById('pdf-file').click()">
+        <strong>拖入 .md / .html</strong>
+        <span id="pdf-file-label">或点击选择文件</span>
+        <input id="pdf-file" type="file" accept=".md,.markdown,.html,.htm,text/markdown,text/html" hidden onchange="handlePdfFilePick(event)" />
+      </div>
+    </div>
+    <form class="composer" onsubmit="event.preventDefault(); sendMessage();">
+      <textarea id="input" placeholder="问 Codex(每条消息独立沙箱)…" rows="1" onkeydown="handleKey(event)" oninput="autoSize(this); toggleSend()"></textarea>
+      <button type="submit" class="send" id="send-btn" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+      </button>
+    </form>
+    <div class="pdf-status" id="pdf-status"></div>
+    <div class="composer-hint" id="composer-hint">每条消息会触发后端 <code style="font-family:'JetBrains Mono',monospace;color:#b4b4b4;">codex exec</code>,跑在新创建的沙箱内。</div>
+  </div>
+</main>
+
+<div class="modal-bg" id="modal">
+  <div class="modal">
+    <h2>设置</h2>
+    <p class="sub">这些只存浏览器 localStorage,不上传到任何地方。</p>
+    <div class="field">
+      <label>后端 endpoint</label>
+      <input id="cfg-endpoint" placeholder="http://106.14.154.23:3030" />
+    </div>
+    <div class="field">
+      <label>OpenAI API Key (sk-…)</label>
+      <input id="cfg-apikey" type="password" placeholder="sk-..." />
+    </div>
+    <div class="field">
+      <label>Demo Key (后端 ?key= / x-demo-key 头,留空表示不需要)</label>
+      <input id="cfg-demokey" placeholder="(可选)" />
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeSettings()">取消</button>
+      <button class="btn primary" onclick="saveSettings()">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const cfg = {
+  endpoint: localStorage.getItem('cfg.endpoint') || '',
+  apiKey:   localStorage.getItem('cfg.apiKey')   || '',
+  serverHasDefaultKey: false,
+  defaultModel: '',
+  demoKey:  localStorage.getItem('cfg.demoKey')  || '',
+};
+let convos = JSON.parse(localStorage.getItem('convos') || '[]');
+let currentId = null;
+let activeMode = 'chat';
+let currentPdfObjectUrl = null;
+
+function openSettings() {
+  document.getElementById('cfg-endpoint').value = cfg.endpoint;
+  document.getElementById('cfg-apikey').value   = cfg.apiKey;
+  document.getElementById('cfg-demokey').value  = cfg.demoKey;
+  document.getElementById('modal').classList.add('open');
+}
+function closeSettings() { document.getElementById('modal').classList.remove('open'); }
+function saveSettings() {
+  cfg.endpoint = document.getElementById('cfg-endpoint').value.trim().replace(/\/$/, '');
+  cfg.apiKey   = document.getElementById('cfg-apikey').value.trim();
+  cfg.demoKey  = document.getElementById('cfg-demokey').value.trim();
+  localStorage.setItem('cfg.endpoint', cfg.endpoint);
+  localStorage.setItem('cfg.apiKey',   cfg.apiKey);
+  localStorage.setItem('cfg.demoKey',  cfg.demoKey);
+  closeSettings();
+  pingHealth();
+}
+
+function endpointPath(path) {
+  return (cfg.endpoint || '') + path + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
+}
+
+async function pingHealth() {
+  const pill = document.getElementById('endpoint-pill');
+  const text = document.getElementById('endpoint-text');
+  pill.className = 'endpoint-pill checking';
+  text.textContent = 'checking ' + cfg.endpoint.replace(/^https?:\/\//, '');
+  try {
+    const r = await fetch(cfg.endpoint + '/healthz', { method: 'GET' });
+    if (r.ok) {
+      try { const j = await r.json(); cfg.serverHasDefaultKey = !!j.serverHasDefaultKey; cfg.defaultModel = j.defaultModel || ''; } catch(_){}
+      pill.className = 'endpoint-pill';
+      const tag = cfg.serverHasDefaultKey ? (' · server key ✓' + (cfg.defaultModel ? ' · ' + cfg.defaultModel : '')) : ' · (no server key)';
+      text.textContent = (cfg.endpoint || 'same-origin').replace(/^https?:\/\//, '') + ' online' + tag;
+    } else {
+      pill.className = 'endpoint-pill offline';
+      text.textContent = 'unhealthy (HTTP ' + r.status + ')';
+    }
+  } catch (e) {
+    pill.className = 'endpoint-pill offline';
+    text.textContent = 'offline';
+  }
+}
+
+function newChat() {
+  currentId = crypto.randomUUID();
+  convos.unshift({ id: currentId, title: '新会话', turns: [] });
+  saveConvos();
+  renderSidebar();
+  renderChat();
+}
+function loadConvo(id) { currentId = id; renderSidebar(); renderChat(); }
+function saveConvos() { localStorage.setItem('convos', JSON.stringify(convos.slice(0, 50))); }
+function currentConvo() { return convos.find(c => c.id === currentId); }
+
+let serverHistory = [];
+
+async function fetchHistory() {
+  try {
+    const r = await fetch(cfg.endpoint + '/history?limit=50');
+    const j = await r.json();
+    if (j && j.ok && Array.isArray(j.rows)) {
+      serverHistory = j.rows;
+      renderSidebar();
+    }
+  } catch {}
+}
+
+async function loadHistoryRun(runId) {
+  currentId = '__history__' + runId;
+  renderSidebar();
+  const turns = document.getElementById('turns');
+  turns.innerHTML = '<div class="empty"><div style="color:var(--text-faint)">读取中…</div></div>';
+  try {
+    const r = await fetch(cfg.endpoint + '/history/' + encodeURIComponent(runId));
+    const j = await r.json();
+    if (!j || !j.ok) throw new Error(j && j.error || 'load failed');
+    const row = j.row;
+    turns.innerHTML = '';
+    appendTurn({ role: 'user', content: row.prompt || '' });
+    // detect quota / 429 anywhere in the recorded output
+    const combined = ((row.stderr || '') + '\n' + (row.stdout || '')).toLowerCase();
+    const quotaExceeded = /429|too many requests|quota|rate.?limit/.test(combined);
+    appendTurn({
+      role: 'assistant',
+      pending: false,
+      ok: row.ok,
+      exitCode: row.exit_code,
+      durationMs: row.duration_ms,
+      model: row.model,
+      runId: row.run_id,
+      createdAt: row.created_at,
+      quotaExceeded: quotaExceeded,
+      stdout: row.stdout || '',
+      stderr: row.stderr || '',
+      isHistory: true,
+    });
+    scrollToBottom();
+  } catch (e) {
+    turns.innerHTML = '<div class="empty"><div style="color:var(--danger)">' + escapeHtml(e.message || String(e)) + '</div></div>';
+  }
+}
+
+function fmtAgo(iso) {
+  const d = new Date(iso).getTime();
+  const s = Math.max(1, Math.floor((Date.now() - d) / 1000));
+  if (s < 60) return s + '秒前';
+  if (s < 3600) return Math.floor(s / 60) + '分钟前';
+  if (s < 86400) return Math.floor(s / 3600) + '小时前';
+  return Math.floor(s / 86400) + '天前';
+}
+
+function renderSidebar() {
+  const list = document.getElementById('convo-list');
+  list.innerHTML = '';
+  // local in-progress convos
+  for (const c of convos.slice(0, 15)) {
+    const el = document.createElement('div');
+    el.className = 'convo-item' + (c.id === currentId ? ' active' : '');
+    el.textContent = c.title;
+    el.onclick = () => loadConvo(c.id);
+    list.appendChild(el);
+  }
+  // cloud history
+  if (serverHistory.length) {
+    const hdr = document.createElement('div');
+    hdr.className = 'sidebar-section';
+    hdr.style.cssText = 'padding:14px 12px 4px;font-size:11px;color:var(--text-faint);display:flex;align-items:center;justify-content:space-between;';
+    hdr.innerHTML = '<span>☁ 云端历史 (' + serverHistory.length + ')</span><span style="cursor:pointer;opacity:.7" title="刷新" onclick="event.stopPropagation();fetchHistory()">↻</span>';
+    list.appendChild(hdr);
+    for (const row of serverHistory) {
+      const el = document.createElement('div');
+      const histId = '__history__' + row.run_id;
+      el.className = 'convo-item' + (currentId === histId ? ' active' : '');
+      el.style.cssText = 'opacity:.92;';
+      const titleTxt = (row.prompt || '(空)').replace(/\s+/g, ' ').slice(0, 38);
+      const dotColor = row.ok ? 'var(--accent,#10a37f)' : 'var(--danger,#ef4444)';
+      el.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:6px;">'
+        + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;">'
+        +   '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:' + dotColor + ';margin-right:6px;vertical-align:middle;"></span>'
+        +   escapeHtml(titleTxt)
+        + '</span>'
+        + '<span style="font-size:10px;color:var(--text-faint);flex-shrink:0;">' + fmtAgo(row.created_at) + '</span>'
+        + '</div>';
+      el.title = row.prompt + '\n\nmodel: ' + (row.model || '-') + '   ' + (row.duration_ms || '?') + 'ms   ' + (row.ok ? 'ok' : 'fail');
+      el.onclick = () => loadHistoryRun(row.run_id);
+      list.appendChild(el);
+    }
+  }
+}
+
+function renderChat() {
+  const turns = document.getElementById('turns');
+  turns.innerHTML = '';
+  const c = currentConvo();
+  if (!c || c.turns.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.innerHTML = `<h1>问点什么吧</h1>
+      <div class="suggestions">
+        <button class="suggestion" onclick="useSuggestion(this)"><div class="title">用 Python 写一个倒序输出字符串的函数</div><div class="sub">含一个 unit test</div></button>
+        <button class="suggestion" onclick="useSuggestion(this)"><div class="title">列出 Linux 中 5 个常用的文本处理工具</div><div class="sub">每个一句话说明</div></button>
+        <button class="suggestion" onclick="usePdfSuggestion()"><div class="title">把 Markdown / HTML 变成 PDF</div><div class="sub">支持 URL 或拖入文件</div></button>
+        <button class="suggestion" onclick="useSuggestion(this)"><div class="title">解释什么是 Linux namespace</div><div class="sub">面向非工程师,300 字以内</div></button>
+      </div>`;
+    turns.appendChild(empty);
+    return;
+  }
+  for (const t of c.turns) appendTurn(t);
+  scrollToBottom();
+}
+
+function appendTurn(t) {
+  const turns = document.getElementById('turns');
+  const empty = document.getElementById('empty');
+  if (empty) empty.remove();
+  const div = document.createElement('div');
+  div.className = 'turn ' + t.role;
+  if (t.role === 'user') {
+    div.innerHTML = `<div class="bubble"></div>`;
+    div.querySelector('.bubble').textContent = t.content;
+  } else {
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    if (t.pending) {
+      bubble.innerHTML = `<div class="typing"><span></span><span></span><span></span></div>`;
+    } else {
+      if (t.pdf) {
+        bubble.appendChild(renderPdfCard(t.pdf));
+      }
+      // history banner: tell the user this is a recorded run, not a live reply
+      if (t.isHistory) {
+        const banner = document.createElement('div');
+        banner.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;padding:8px 12px;border-radius:8px;background:' + (t.ok ? 'rgba(16,163,127,0.08)' : 'rgba(239,68,68,0.10)') + ';border:1px solid ' + (t.ok ? 'rgba(16,163,127,0.25)' : 'rgba(239,68,68,0.30)') + ';font-size:12px;color:var(--text-dim);';
+        const statusIcon = t.ok ? '✓' : '✕';
+        const statusText = t.ok ? '成功' : (t.quotaExceeded ? '失败 · 配额已满 429' : '失败');
+        const statusColor = t.ok ? 'var(--accent,#10a37f)' : 'var(--danger,#ef4444)';
+        const modelTxt = t.model ? escapeHtml(t.model) : '-';
+        const durTxt = t.durationMs ? (t.durationMs/1000).toFixed(1) + 's' : '-';
+        const agoTxt = t.createdAt ? fmtAgo(t.createdAt) : '';
+        banner.innerHTML = '<span style="font-weight:600;color:' + statusColor + ';">' + statusIcon + ' ' + statusText + '</span>'
+          + '<span style="opacity:.6;">|</span>'
+          + '<span>model <code style="background:rgba(255,255,255,0.06);padding:1px 6px;border-radius:4px;">' + modelTxt + '</code></span>'
+          + '<span style="opacity:.6;">|</span>'
+          + '<span>' + durTxt + '</span>'
+          + (agoTxt ? '<span style="opacity:.6;">|</span><span>' + agoTxt + '</span>' : '')
+          + '<span style="flex:1;"></span>'
+          + '<span style="opacity:.6;font-size:11px;">📜 历史记录</span>';
+        bubble.appendChild(banner);
+      }
+      if (t.error) {
+        bubble.innerHTML += `<div style="color:var(--danger);font-weight:500;">⚠ ${escapeHtml(t.error)}</div>`;
+      }
+      // short summary above raw output for failed runs
+      if (t.isHistory && !t.ok) {
+        const summary = document.createElement('div');
+        summary.style.cssText = 'font-size:13px;color:var(--text);line-height:1.55;margin-bottom:10px;padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.06);border-left:3px solid var(--danger,#ef4444);';
+        let msg;
+        if (t.quotaExceeded) {
+          msg = '网关返回 <strong>429 Too Many Requests</strong>,Codex 重试到上限后退出。完整日志见下方。';
+        } else if (t.stderr && t.stderr.trim()) {
+          msg = 'Codex 退出码 <strong>' + escapeHtml(String(t.exitCode ?? '?')) + '</strong>。失败原因见 stderr。';
+        } else {
+          msg = 'Codex 退出码 <strong>' + escapeHtml(String(t.exitCode ?? '?')) + '</strong>,但没有写入 stderr。完整 stdout 见下方。';
+        }
+        summary.innerHTML = msg;
+        bubble.appendChild(summary);
+      }
+      if (t.stdout) {
+        const pre = document.createElement('pre');
+        pre.className = 'code';
+        pre.textContent = t.stdout;
+        bubble.appendChild(pre);
+      }
+      if (t.stderr) {
+        const pre = document.createElement('pre');
+        pre.className = 'code stderr';
+        pre.textContent = t.stderr;
+        bubble.appendChild(pre);
+      }
+      const meta = document.createElement('div');
+      meta.className = 'turn-meta';
+      if (t.pending) {
+        meta.innerHTML = '<span class="badge live pending-elapsed">⏱ 0.0s</span>'
+          + '<span class="badge cancel" onclick="cancelRun()">✕ 取消</span>';
+      } else if (t.isHistory) {
+        // keep meta compact for history — banner already carries the key fields
+        const sandboxBadge = t.runId ? `<span class="badge sandbox">sandbox ${t.runId.slice(0,8)}</span>` : '';
+        meta.innerHTML = sandboxBadge;
+      } else {
+        const okBadge = `<span class="badge ${t.ok ? 'ok' : 'err'}">exit ${t.exitCode ?? '?'}</span>`;
+        const durBadge = t.durationMs ? `<span class="badge">${(t.durationMs/1000).toFixed(1)}s</span>` : '';
+        const phaseBadge = (t.spawnMs || t.gatewayMs) ? `<span class="badge">spawn ${(t.spawnMs||0)}ms · 网关 ${(t.gatewayMs||0)}ms</span>` : '';
+        const quotaBadge = t.quotaExceeded ? '<span class="badge quota">⚠ 配额已满 429</span>' : '';
+        const sandboxBadge = t.runId ? `<span class="badge sandbox">sandbox ${t.runId.slice(0,8)}</span>` : '';
+        meta.innerHTML = okBadge + durBadge + phaseBadge + quotaBadge + sandboxBadge;
+      }
+      bubble.appendChild(meta);
+    }
+    div.appendChild(bubble);
+  }
+  turns.appendChild(div);
+}
+
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function scrollToBottom() { const s = document.getElementById('scroll'); s.scrollTop = s.scrollHeight; }
+
+function renderPdfCard(pdf) {
+  const card = document.createElement('div');
+  card.className = 'pdf-card';
+  const title = pdf.filename || pdf.title || 'webfirst.pdf';
+  const previewUrl = pdf.previewUrl || pdf.pdfUrl || pdf.downloadUrl;
+  const downloadUrl = pdf.downloadUrl || pdf.pdfUrl || pdf.previewUrl;
+  const head = document.createElement('div');
+  head.className = 'pdf-card-head';
+  head.innerHTML = '<div class="pdf-card-title"></div><div class="pdf-card-actions"></div>';
+  head.querySelector('.pdf-card-title').textContent = title;
+  const actions = head.querySelector('.pdf-card-actions');
+  if (previewUrl) {
+    const open = document.createElement('a');
+    open.href = previewUrl;
+    open.target = '_blank';
+    open.rel = 'noopener';
+    open.textContent = '预览';
+    actions.appendChild(open);
+  }
+  if (downloadUrl) {
+    const download = document.createElement('a');
+    download.href = downloadUrl;
+    download.download = title;
+    download.className = 'primary';
+    download.textContent = '下载';
+    actions.appendChild(download);
+  }
+  card.appendChild(head);
+  if (previewUrl) {
+    const frame = document.createElement('iframe');
+    frame.className = 'pdf-preview';
+    frame.src = previewUrl;
+    frame.title = 'PDF preview';
+    card.appendChild(frame);
+  }
+  const bits = [];
+  if (pdf.pageCount) bits.push(pdf.pageCount + ' pages');
+  if (pdf.source) bits.push(pdf.source);
+  if (pdf.jobId) bits.push('job ' + pdf.jobId);
+  if (bits.length) {
+    const meta = document.createElement('div');
+    meta.className = 'pdf-meta';
+    meta.textContent = bits.join(' · ');
+    card.appendChild(meta);
+  }
+  return card;
+}
+
+function useSuggestion(el) {
+  setMode('chat');
+  document.getElementById('input').value = el.querySelector('.title').textContent;
+  autoSize(document.getElementById('input'));
+  toggleSend();
+}
+
+function usePdfSuggestion() {
+  setMode('pdf');
+  document.getElementById('pdf-url').focus();
+}
+
+function setMode(mode) {
+  activeMode = mode;
+  document.body.classList.toggle('pdf-mode', mode === 'pdf');
+  document.getElementById('chat-mode-tab').classList.toggle('active', mode === 'chat');
+  document.getElementById('pdf-mode-tab').classList.toggle('active', mode === 'pdf');
+  document.getElementById('composer-hint').innerHTML =
+    mode === 'pdf'
+      ? 'PDF 模式会把 URL 或 .md/.html 文件交给后端 web-first PDF 工作流。'
+      : "每条消息会触发后端 <code style=\"font-family:'JetBrains Mono',monospace;color:#b4b4b4;\">codex exec</code>,跑在新创建的沙箱内。";
+  if (mode === 'chat') document.getElementById('input').focus();
+}
+
+function autoSize(ta) { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'; }
+function toggleSend() {
+  const t = document.getElementById('input').value.trim();
+  document.getElementById('send-btn').disabled = !t;
+}
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+function togglePdfUrl() {
+  const value = document.getElementById('pdf-url').value.trim();
+  document.getElementById('pdf-url-btn').disabled = !/^https?:\/\/\S+/i.test(value);
+}
+
+function handlePdfUrlKey(e) {
+  if (e.key === 'Enter') { e.preventDefault(); submitPdfUrl(); }
+}
+
+function setPdfStatus(message, isError = false) {
+  const el = document.getElementById('pdf-status');
+  el.textContent = message || '';
+  el.style.color = isError ? 'var(--danger)' : 'var(--text-faint)';
+}
+
+function ensurePdfConversation(sourceLabel) {
+  if (!currentId) newChat();
+  const c = currentConvo();
+  c.turns.push({ role: 'user', content: sourceLabel });
+  if (c.turns.length === 1) c.title = sourceLabel.slice(0, 30);
+  const assistantTurn = { role: 'assistant', pending: true };
+  c.turns.push(assistantTurn);
+  renderSidebar();
+  renderChat();
+  return assistantTurn;
+}
+
+async function submitPdfUrl() {
+  const input = document.getElementById('pdf-url');
+  const sourceUrl = input.value.trim();
+  if (!/^https?:\/\/\S+/i.test(sourceUrl)) return;
+  const assistantTurn = ensurePdfConversation('生成 PDF: ' + sourceUrl);
+  setPdfStatus('正在生成 PDF…');
+  document.getElementById('pdf-url-btn').disabled = true;
+  try {
+    const r = await fetch(endpointPath('/pdf/from-url'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: sourceUrl, mode: 'webfirst' }),
+    });
+    const pdf = await parsePdfResponse(r, sourceUrl);
+    Object.assign(assistantTurn, { pending: false, ok: true, exitCode: 0, pdf });
+    input.value = '';
+    setPdfStatus('PDF 已生成');
+  } catch (e) {
+    Object.assign(assistantTurn, { pending: false, ok: false, error: String(e.message || e) });
+    setPdfStatus(String(e.message || e), true);
+  } finally {
+    togglePdfUrl();
+    saveConvos();
+    renderChat();
+  }
+}
+
+function handlePdfFilePick(event) {
+  const file = event.target.files && event.target.files[0];
+  if (file) submitPdfFile(file);
+  event.target.value = '';
+}
+
+async function submitPdfFile(file) {
+  if (!/\.(md|markdown|html|htm)$/i.test(file.name)) {
+    setPdfStatus('只支持 .md / .markdown / .html / .htm 文件', true);
+    return;
+  }
+  document.getElementById('pdf-file-label').textContent = file.name;
+  const assistantTurn = ensurePdfConversation('生成 PDF: ' + file.name);
+  setPdfStatus('正在上传并生成 PDF…');
+  try {
+    const body = new FormData();
+    body.append('file', file, file.name);
+    body.append('mode', 'webfirst');
+    const r = await fetch(endpointPath('/pdf/from-file'), { method: 'POST', body });
+    const pdf = await parsePdfResponse(r, file.name);
+    Object.assign(assistantTurn, { pending: false, ok: true, exitCode: 0, pdf });
+    setPdfStatus('PDF 已生成');
+  } catch (e) {
+    Object.assign(assistantTurn, { pending: false, ok: false, error: String(e.message || e) });
+    setPdfStatus(String(e.message || e), true);
+  } finally {
+    saveConvos();
+    renderChat();
+  }
+}
+
+async function parsePdfResponse(response, source) {
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(text || ('PDF endpoint failed: HTTP ' + response.status));
+  }
+  const type = response.headers.get('content-type') || '';
+  if (type.includes('application/pdf')) {
+    if (currentPdfObjectUrl) URL.revokeObjectURL(currentPdfObjectUrl);
+    const blob = await response.blob();
+    currentPdfObjectUrl = URL.createObjectURL(blob);
+    return { filename: filenameFromHeaders(response) || 'webfirst.pdf', pdfUrl: currentPdfObjectUrl, downloadUrl: currentPdfObjectUrl, previewUrl: currentPdfObjectUrl, source };
+  }
+  const payload = await response.json();
+  if (payload.ok === false) throw new Error(payload.error || 'PDF generation failed');
+  const pdf = payload.pdf || payload;
+  const dataUrl = pdf.pdfBase64 ? pdfBase64ToObjectUrl(pdf.pdfBase64) : '';
+  return {
+    filename: pdf.filename || pdf.name || 'webfirst.pdf',
+    pdfUrl: normalizeAssetUrl(pdf.pdfUrl || pdf.url || dataUrl),
+    downloadUrl: normalizeAssetUrl(pdf.downloadUrl || pdf.pdfUrl || pdf.url || dataUrl),
+    previewUrl: normalizeAssetUrl(pdf.previewUrl || pdf.pdfUrl || pdf.url || dataUrl),
+    pageCount: pdf.pageCount || pdf.pages,
+    jobId: pdf.jobId || payload.jobId,
+    source,
+  };
+}
+
+function normalizeAssetUrl(url) {
+  if (!url) return '';
+  if (/^(blob:|data:|https?:\/\/)/i.test(url)) return url;
+  const base = cfg.endpoint || window.location.origin;
+  return base.replace(/\/$/, '') + '/' + String(url).replace(/^\//, '');
+}
+
+function pdfBase64ToObjectUrl(base64) {
+  if (currentPdfObjectUrl) URL.revokeObjectURL(currentPdfObjectUrl);
+  const raw = atob(base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  currentPdfObjectUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+  return currentPdfObjectUrl;
+}
+
+function filenameFromHeaders(response) {
+  const cd = response.headers.get('content-disposition') || '';
+  const match = cd.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+  return match ? decodeURIComponent(match[1].replace(/"$/, '')) : '';
+}
+
+let activeController = null;
+function cancelRun() { if (activeController) { try { activeController.abort(); } catch {} } }
+
+async function sendMessage() {
+  const ta = document.getElementById('input');
+  const prompt = ta.value.trim();
+  if (!prompt) return;
+  // server has a default LLM key; only blocked when /healthz says serverHasDefaultKey=false
+  if (!cfg.serverHasDefaultKey && !cfg.apiKey) { alert('服务器未配置默认 key,请在「设置」里填 API Key'); openSettings(); return; }
+
+  if (!currentId) newChat();
+  const c = currentConvo();
+  c.turns.push({ role: 'user', content: prompt });
+  if (c.turns.length === 1) c.title = prompt.slice(0, 30);
+
+  const t0 = performance.now();
+  const assistantTurn = { role: 'assistant', pending: true, sentAt: t0 };
+  c.turns.push(assistantTurn);
+
+  ta.value = ''; autoSize(ta); toggleSend();
+  renderSidebar();
+  renderChat();
+
+  // live elapsed timer — updates the .pending-elapsed badge every 200ms
+  const timerId = setInterval(() => {
+    if (!assistantTurn.pending) { clearInterval(timerId); return; }
+    const el = document.querySelector('.turn:last-child .pending-elapsed');
+    if (el) el.textContent = '⏱ ' + ((performance.now() - t0) / 1000).toFixed(1) + 's';
+  }, 200);
+
+  const controller = new AbortController();
+  activeController = controller;
+  try {
+    const url = cfg.endpoint + '/run' + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}), timeoutSec: 120 }),
+      signal: controller.signal,
+    });
+    const j = await r.json();
+    Object.assign(assistantTurn, j, { pending: false, elapsedMs: performance.now() - t0 });
+  } catch (e) {
+    const cancelled = e.name === 'AbortError';
+    Object.assign(assistantTurn, {
+      pending: false, ok: false,
+      error: cancelled ? '已取消' : String(e.message || e),
+      elapsedMs: performance.now() - t0,
+    });
+  }
+  clearInterval(timerId);
+  activeController = null;
+  saveConvos();
+  renderChat();
+  fetchHistory();  // refresh cloud history after each /run
+}
+
+const pdfDrop = document.getElementById('pdf-drop');
+pdfDrop.addEventListener('dragover', (event) => {
+  event.preventDefault();
+  pdfDrop.classList.add('dragging');
+});
+pdfDrop.addEventListener('dragleave', () => pdfDrop.classList.remove('dragging'));
+pdfDrop.addEventListener('drop', (event) => {
+  event.preventDefault();
+  pdfDrop.classList.remove('dragging');
+  const file = event.dataTransfer.files && event.dataTransfer.files[0];
+  if (file) submitPdfFile(file);
+});
+
+// init
+renderSidebar();
+renderChat();
+pingHealth();
+fetchHistory();
+setInterval(pingHealth, 30000);
+setInterval(fetchHistory, 60000);
+// no auto-popup: server default key is used unless user overrides via Settings
+</script>
+</body>
+</html>

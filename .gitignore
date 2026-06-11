@@ -1,0 +1,36 @@
+# Local secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Worktrees / test artifacts
+.playwright-mcp/
+workspace/pdf-*.png
+workspace/pdf-ui*.png
+workspace/work/          # md-to-pdf-webfirst scratch workdirs (chrome-profile, etc.)
+workspace/**/chrome-profile/
+workspace/**/Default/
+workspace/**/*.pdf.png
+/tmp/codex-pdf-out/
+/tmp/codex-pdf-up/
+
+# Server-side scratch (mirror what's on /opt/codex-api/ but never source-controlled)
+*.bak
+server.js.bak.*
+secret.env
