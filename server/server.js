@@ -203,18 +203,32 @@ const MAX_TIMEOUT     = 900;
 // ─── async /run: in-memory job store + per-job EventEmitter for SSE ───
 const JOBS = new Map();              // jobId -> { state, emitter, ... }
 const JOBS_TTL_MS = 60 * 60 * 1000;  // GC finished jobs after 1h
+const EVENTS_RING_MAX = 5000;        // max buffered events per job for replay (ISSUE-011)
 
 function newJobId() { return randomUUID(); }
 function makeJob(initial) {
   const emitter = new (require('events'))();
-  const job = { ...initial, emitter, subscribers: 0 };
+  const job = {
+    ...initial,
+    emitter,
+    subscribers: 0,
+    events: [],         // ring buffer of past events; replayed on Last-Event-ID / ?resume=
+    eventSeq: 0,        // monotonic counter; surfaces as evt-<n> for clients
+  };
   JOBS.set(job.id, job);
   return job;
 }
 function emitJob(job, type, payload) {
-  const evt = { type, ts: Date.now(), ...payload };
+  job.eventSeq += 1;
+  const evt = { id: 'evt-' + job.eventSeq, type, ts: Date.now(), ...payload };
   job.lastEvent = evt;
+  // ring buffer: bounded so a runaway job can't OOM the process. Drop the
+  // oldest when over the cap; clients resuming past the cap fall back to
+  // RDS (see handleJobEvents).
+  if (job.events.length >= EVENTS_RING_MAX) job.events.shift();
+  job.events.push(evt);
   job.emitter.emit('event', evt);
+  return evt;
 }
 function gcJob(job) {
   setTimeout(() => { if (JOBS.get(job.id) === job) JOBS.delete(job.id); }, JOBS_TTL_MS).unref();
@@ -928,7 +942,22 @@ async function handleJobStatus(req, res, jobId) {
 
 // SSE: stream job events. The first event is always a 'snapshot' with the
 // current state, so a late subscriber doesn't miss the start.
+//
+// Replay semantics (ISSUE-011): if the client passes ?resume=<evtId> (or the
+// browser auto-sends Last-Event-ID), we replay every event with id > that
+// one from the in-memory ring, then attach the live tail. EventSource in the
+// browser can't set custom headers, so the frontend uses ?resume=<lastEventId>
+// — both shapes are accepted.
+//
+// Memory miss → 404. Frontend falls back to one-shot /job/:id poll which
+// already walks RDS (ISSUE-010).
 function handleJobEvents(req, res, jobId) {
+  const url = new URL(req.url, 'http://x');
+  const resumeId =
+    (req.headers['last-event-id'] || '').toString().trim() ||
+    (url.searchParams.get('resume') || '').toString().trim() ||
+    null;
+
   const job = JOBS.get(jobId);
   if (!job) return json(res, 404, { ok: false, error: 'job not found or expired' });
 
@@ -939,15 +968,51 @@ function handleJobEvents(req, res, jobId) {
     'X-Accel-Buffering': 'no',
   });
   const write = (type, data) => {
-    try { res.write('event: ' + type + '\ndata: ' + JSON.stringify(data) + '\n\n'); } catch {}
+    try {
+      // emit SSE `id:` field when payload carries one, so EventSource's
+      // built-in auto-resume will also know what it last saw (we still
+      // force ?resume= in the manual path because EventSource can't add
+      // custom headers).
+      const idLine = data && data.id ? ('id: ' + data.id + '\n') : '';
+      res.write(idLine + 'event: ' + type + '\ndata: ' + JSON.stringify(data) + '\n\n');
+    } catch {}
   };
-  // initial snapshot
+
+  // Replay from the requested cursor. If resumeId is unknown (typo, or
+  // outside the ring), default to replay-everything so the client at least
+  // converges to the current state.
+  let replayFrom = 0;
+  if (resumeId) {
+    const idx = job.events.findIndex((e) => e.id === resumeId);
+    if (idx >= 0) {
+      replayFrom = idx + 1;          // skip the one they already saw
+    } else {
+      replayFrom = 0;                // unknown id → full replay
+    }
+  }
+
+  // initial snapshot — always sent, even on resume, so the client has the
+  // authoritative current state before any tail events
   write('snapshot', {
+    id: 'snap-' + job.eventSeq,
     jobId: job.id, state: job.state, runId: job.runId,
     started: job.started, finished: job.finished,
     durationMs: job.durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs,
     quotaExceeded: job.quotaExceeded, exitCode: job.exitCode, ok: job.ok, error: job.error,
+    resumed: !!resumeId,
   });
+
+  for (let i = replayFrom; i < job.events.length; i++) {
+    const e = job.events[i];
+    write(e.type, e);
+  }
+
+  // If the job already finished before we attached, close after replay.
+  if (job.state === 'done' || job.state === 'error' || job.state === 'cancelled') {
+    try { res.end(); } catch {}
+    return;
+  }
+
   const onEvent = (evt) => write(evt.type, evt);
   job.emitter.on('event', onEvent);
   job.subscribers++;

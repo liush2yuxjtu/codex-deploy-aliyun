@@ -1226,72 +1226,167 @@ async function sendAsync(prompt, controller, assistantTurn, t0) {
   Object.assign(assistantTurn, { pending: true, jobId: init.jobId, async: true, runId: init.runId });
   renderChat();
 
-  // 2. EventSource against /job/:id/events (SSE) — gives us live progress
-  const eventsUrl = (cfg.endpoint + init.eventsUrl) + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
-  const es = new EventSource(eventsUrl);
+  // 2. EventSource against /job/:id/events (SSE) — gives us live progress.
+  // We own the connection lifecycle: open → on error, manually close +
+  // re-open with ?resume=<lastEventId>. EventSource's built-in auto-retry
+  // exists but only sends Last-Event-ID (not query string); we want both
+  // because some browsers / proxies ignore Last-Event-ID for cross-origin
+  // event streams. See ISSUE-011.
+  const baseEventsUrl = cfg.endpoint + init.eventsUrl;
+  let es = null;
+  let lastEventId = null;          // tracks the highest id we've consumed
+  let reconnectTimer = null;
   let done = false;
+  let manualClosed = false;
+
   const finish = (payload) => {
     if (done) return;
     done = true;
-    try { es.close(); } catch {}
-    Object.assign(assistantTurn, payload, { pending: false, elapsedMs: performance.now() - t0 });
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    try { if (es) es.close(); } catch {}
+    Object.assign(assistantTurn, payload, { pending: false, elapsedMs: performance.now() - t0, reconnecting: false });
     renderChat();
   };
-  es.addEventListener('snapshot', (e) => {
-    const s = JSON.parse(e.data);
-    if (s.state === 'done' || s.state === 'error') {
-      finish({ ok: !!s.ok, exitCode: s.exitCode, runId: s.runId, durationMs: s.durationMs, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs, quotaExceeded: s.quotaExceeded, error: s.error, stdout: s.stdoutPreview || '', stderr: s.stderrPreview || '' });
-    } else if (s.state === 'cancelled') {
-      finish({ ok: false, exitCode: s.exitCode != null ? s.exitCode : 130, runId: s.runId, durationMs: s.durationMs, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs, cancelled: true, cancelReason: s.cancelReason || 'user_cancelled' });
-    } else {
-      Object.assign(assistantTurn, { jobState: s.state, runId: s.runId, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs });
-      renderChat();
-    }
-  });
-  es.addEventListener('start', () => { assistantTurn.jobState = 'running'; renderChat(); });
-  es.addEventListener('running', () => { assistantTurn.jobState = 'running'; renderChat(); });
-  es.addEventListener('firstByte', (e) => {
-    const d = JSON.parse(e.data);
-    assistantTurn.spawnMs = d.spawnMs;
+
+  const setReconnecting = (on) => {
+    assistantTurn.reconnecting = !!on;
     renderChat();
-  });
-  es.addEventListener('done', (e) => {
-    const d = JSON.parse(e.data);
-    finish({ ok: !!d.ok, exitCode: d.exitCode, runId: init.runId, durationMs: d.durationMs, spawnMs: d.spawnMs, gatewayMs: d.gatewayMs, quotaExceeded: d.quotaExceeded, error: d.error, stdout: d.stdout || '', stderr: d.stderr || '' });
-  });
-  es.addEventListener('error', (e) => {
-    // EventSource auto-reconnects on transient errors. Only treat as fatal
-    // if the job is gone. We fall back to a one-shot status poll.
-    if (done) return;
-    fetch(cfg.endpoint + '/job/' + assistantTurn.jobId).then(r => r.json()).then(s => {
+  };
+
+  const openStream = () => {
+    if (manualClosed || done) return;
+    const params = new URLSearchParams();
+    if (cfg.demoKey) params.set('key', cfg.demoKey);
+    if (lastEventId) params.set('resume', lastEventId);
+    const url = baseEventsUrl + '?' + params.toString();
+    es = new EventSource(url);
+
+    // Helper: any successfully-parsed event gives us an id we can replay from.
+    // e.lastEventId is set by the browser from the SSE `id:` field (server
+    // emits one for every event with a payload id).
+    const recordId = (e) => {
+      if (e && e.lastEventId) lastEventId = e.lastEventId;
+    };
+
+    es.addEventListener('snapshot', (e) => {
+      recordId(e);
+      const s = JSON.parse(e.data);
       if (s.state === 'done' || s.state === 'error') {
         finish({ ok: !!s.ok, exitCode: s.exitCode, runId: s.runId, durationMs: s.durationMs, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs, quotaExceeded: s.quotaExceeded, error: s.error, stdout: s.stdoutPreview || '', stderr: s.stderrPreview || '' });
+      } else if (s.state === 'cancelled') {
+        finish({ ok: false, exitCode: s.exitCode != null ? s.exitCode : 130, runId: s.runId, durationMs: s.durationMs, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs, cancelled: true, cancelReason: s.cancelReason || 'user_cancelled' });
+      } else {
+        Object.assign(assistantTurn, { jobState: s.state, runId: s.runId, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs });
+        renderChat();
       }
-    }).catch(() => {});
-  });
-  // ISSUE-002: server-side confirmation that the job was killed.
-  // Treat exactly like `done` from the UI's perspective, but mark `cancelled`
-  // so the meta row shows the static "已取消" label instead of the live timer.
-  es.addEventListener('cancelled', (e) => {
-    let d = {};
-    try { d = JSON.parse(e.data || '{}'); } catch {}
-    finish({
-      ok: false,
-      exitCode: d.exitCode != null ? d.exitCode : 130,
-      runId: d.runId || init.runId,
-      durationMs: d.durationMs != null ? d.durationMs : (performance.now() - t0),
-      spawnMs: d.spawnMs,
-      gatewayMs: d.gatewayMs,
-      cancelled: true,
-      cancelReason: d.reason || 'user_cancelled',
     });
-  });
+    es.addEventListener('start', (e) => { recordId(e); assistantTurn.jobState = 'running'; renderChat(); });
+    es.addEventListener('running', (e) => { recordId(e); assistantTurn.jobState = 'running'; renderChat(); });
+    es.addEventListener('firstByte', (e) => {
+      recordId(e);
+      const d = JSON.parse(e.data);
+      assistantTurn.spawnMs = d.spawnMs;
+      renderChat();
+    });
+    es.addEventListener('done', (e) => {
+      recordId(e);
+      const d = JSON.parse(e.data);
+      finish({ ok: !!d.ok, exitCode: d.exitCode, runId: init.runId, durationMs: d.durationMs, spawnMs: d.spawnMs, gatewayMs: d.gatewayMs, quotaExceeded: d.quotaExceeded, error: d.error, stdout: d.stdout || '', stderr: d.stderr || '' });
+    });
+    // ISSUE-002: server-side confirmation that the job was killed.
+    // Treat exactly like `done` from the UI's perspective, but mark `cancelled`
+    // so the meta row shows the static "已取消" label instead of the live timer.
+    es.addEventListener('cancelled', (e) => {
+      recordId(e);
+      let d = {};
+      try { d = JSON.parse(e.data || '{}'); } catch {}
+      finish({
+        ok: false,
+        exitCode: d.exitCode != null ? d.exitCode : 130,
+        runId: d.runId || init.runId,
+        durationMs: d.durationMs != null ? d.durationMs : (performance.now() - t0),
+        spawnMs: d.spawnMs,
+        gatewayMs: d.gatewayMs,
+        cancelled: true,
+        cancelReason: d.reason || 'user_cancelled',
+      });
+    });
+    // ISSUE-012: live tail view. The server batches lines at 100ms throttle,
+    // so we just append to assistantTurn.tailLines and refresh the panel in
+    // place — no full re-render of the card.
+    es.addEventListener('codexStdout:line', (e) => {
+      recordId(e);
+      let d = {};
+      try { d = JSON.parse(e.data || '{}'); } catch {}
+      if (!Array.isArray(d.lines) || !d.lines.length) return;
+      const lines = ensureTailBuckets(assistantTurn);
+      for (const l of d.lines) lines.stdout.push(l);
+      refreshTailPanel(assistantTurn);
+    });
+    es.addEventListener('codexStderr:line', (e) => {
+      recordId(e);
+      let d = {};
+      try { d = JSON.parse(e.data || '{}'); } catch {}
+      if (!Array.isArray(d.lines) || !d.lines.length) return;
+      const lines = ensureTailBuckets(assistantTurn);
+      for (const l of d.lines) lines.stderr.push(l);
+      refreshTailPanel(assistantTurn);
+    });
+    es.addEventListener('error', (e) => {
+      if (manualClosed || done) return;
+      // EventSource fires 'error' for both transport hiccups and hard
+      // server-side close (the latter sets es.readyState = CLOSED). We
+      // handle both: always close, always re-open with ?resume=.
+      try { es.close(); } catch {}
+      probeThenSchedule();
+    });
+  };
+
+  // One-shot status probe. If the job is terminal we finish; otherwise we
+  // schedule a reconnect (5s) so the user sees the spinner for at least that
+  // long, matching the AC's "<5s 不重连" rule. We then re-open the SSE stream
+  // with ?resume= so the server replays anything we missed.
+  const probeThenSchedule = () => {
+    if (done || manualClosed) return;
+    fetch(cfg.endpoint + '/job/' + assistantTurn.jobId).then(r => r.json()).then(s => {
+      if (s.state === 'done' || s.state === 'error' || s.state === 'cancelled') {
+        finish({ ok: !!s.ok, exitCode: s.exitCode, runId: s.runId, durationMs: s.durationMs, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs, quotaExceeded: s.quotaExceeded, error: s.error, stdout: s.stdoutPreview || '', stderr: s.stderrPreview || '' });
+        return;
+      }
+      // still running — schedule reconnect
+      setReconnecting(true);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        if (done || manualClosed) return;
+        assistantTurn.reconnecting = false;
+        renderChat();
+        openStream();
+      }, 5000);
+    }).catch(() => {
+      // probe failed (network down) — try again in 5s, no max-attempt cap so
+      // we always come back when the network returns
+      setReconnecting(true);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        if (done || manualClosed) return;
+        assistantTurn.reconnecting = false;
+        renderChat();
+        openStream();
+      }, 5000);
+    });
+  };
+
+  openStream();
 
   // 3. Cancellation — closing the EventSource also gives the user a way out,
   // but we don't kill the server-side job (the timeout will eventually).
   // If the user clicks "取消", we close ES and mark the turn as cancelled.
   // The server job keeps running until its killTimer fires.
-  controller.signal.addEventListener('abort', () => { es.close(); });
+  controller.signal.addEventListener('abort', () => {
+    manualClosed = true;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    try { if (es) es.close(); } catch {}
+  });
 }
 
 const pdfDrop = document.getElementById('pdf-drop');
