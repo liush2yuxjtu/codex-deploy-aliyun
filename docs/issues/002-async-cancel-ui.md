@@ -13,7 +13,9 @@ risk: low
 effort: small
 expected_commits: 1
 ready_for_agent: true
-status: pending
+status: done
+merged_commit: dfd7cca
+closed_at: 2026-06-12
 ---
 
 # ISSUE-002: 异步卡片可取消(前端 UI)
