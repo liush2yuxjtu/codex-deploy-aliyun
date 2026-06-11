@@ -14,7 +14,9 @@ risk: medium
 effort: small
 expected_commits: 1
 ready_for_agent: true
-status: pending
+status: done
+merged_commit: 77195f1
+closed_at: 2026-06-12
 ---
 
 # ISSUE-011: SSE Last-Event-ID 断线重连
