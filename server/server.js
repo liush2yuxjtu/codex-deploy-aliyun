@@ -63,15 +63,23 @@ async function recordRun(row) {
   if (!pgPool) return;
   try {
     await pgPool.query(
-      `INSERT INTO codex_runs(run_id, prompt, model, exit_code, duration_ms, stdout, stderr, ok, error, client_ip)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      // ISSUE-014: persist the codex-assigned session id and the
+      // parent_session_id when the run was resumed from a previous one.
+      // Both columns live in migration 002_codex_runs_session.sql; if the
+      // migration hasn't run yet the INSERT will fail and the catch logs
+      // the error — we never break the user-facing /run response on
+      // persistence failure.
+      `INSERT INTO codex_runs(run_id, prompt, model, exit_code, duration_ms, stdout, stderr, ok, error, client_ip, codex_session_id, parent_session_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
       [row.runId, row.prompt, row.model, row.exitCode ?? null,
        row.durationMs ?? null,
        (row.stdout || '').slice(0, 200000),
        (row.stderr || '').slice(0, 40000),
        !!row.ok,
        row.error || null,
-       row.clientIp || null]
+       row.clientIp || null,
+       row.codexSessionId ?? null,
+       row.parentSessionId ?? null]
     );
   } catch (e) {
     console.error('[recordRun] insert failed:', e.message);
@@ -225,6 +233,49 @@ try {
 }
 const DEFAULT_TIMEOUT = 90;
 const MAX_TIMEOUT     = 900;
+
+// ─── parseCodexSessionId (ISSUE-014) ───
+// codex exec --json emits NDJSON events; thread.started carries a UUID that
+// is the codex-assigned session id. We scan the buffer once on the
+// happy path and once on resume — for a successful resume the event
+// re-fires with the SAME id (parent_session_id == codex_session_id of
+// the prior run). For a failed resume (session not found / GC'd) the
+// id is either absent or new, so the caller can decide to fall back.
+//
+// Robust to:
+//   - multiple JSON lines in a single chunk (we split on \n)
+//   - thread id appearing in plain text, not just the JSON event
+//     (e.g. error messages like "session 5a31… not found") — first match wins
+//   - non-JSON noise (we never throw on a single bad line)
+const CODEX_SESSION_ID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+function parseCodexSessionId(stdoutOrStderr) {
+  if (!stdoutOrStderr) return null;
+  const text = String(stdoutOrStderr);
+  // First, look for an explicit thread.started JSON line — most reliable.
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (!trimmed.startsWith('{')) continue;
+    try {
+      const obj = JSON.parse(trimmed);
+      // The CLI's NDJSON shape: { type: "thread.started", thread_id: "..." }
+      // or { event: "thread.started", payload: { id: "..." } } depending on
+      // version. Accept either.
+      const direct = obj.thread_id || obj.session_id || obj.sessionId
+        || (obj.payload && (obj.payload.id || obj.payload.session_id));
+      if (typeof direct === 'string' && CODEX_SESSION_ID_RE.test(direct)) return direct;
+      if (obj.type === 'thread.started' || obj.event === 'thread.started') {
+        const id = obj.thread_id || (obj.payload && obj.payload.id);
+        if (typeof id === 'string' && CODEX_SESSION_ID_RE.test(id)) return id;
+      }
+    } catch { /* not JSON, skip */ }
+  }
+  // Fallback: any UUID-shaped token in the combined text. Less precise but
+  // covers cases where codex prints the id outside of a JSON envelope
+  // (e.g. on stderr warnings). First match wins.
+  const m = text.match(CODEX_SESSION_ID_RE);
+  return m ? m[0] : null;
+}
 
 // ─── async /run: in-memory job store + per-job EventEmitter for SSE ───
 const JOBS = new Map();              // jobId -> { state, emitter, ... }
@@ -388,8 +439,12 @@ async function killJobTree(child, { gracefulMs = 5000, jobId = '-', reason = 'us
 }
 
 // Shared spawn helper used by both handleRun (sync) and handleRunAsync.
-// Returns { child, runId, workDir, started, firstBytePromise }.
-function startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientIp }) {
+// Returns { child, runId, workDir, started, sessionId }.
+// ISSUE-014: when `sessionId` is supplied, the command becomes
+//   `codex exec resume <sid> <prompt>` instead of `codex exec ... <prompt>`.
+// The sessionId is returned on the spawn object so the caller can record
+// it as `parent_session_id` on the new codex_runs row.
+function startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientIp, sessionId }) {
   const runId = randomUUID();
   const workDir = path.join(RUN_BASE, runId);
   fs.mkdirSync(workDir, { recursive: true, mode: 0o770 });
@@ -398,8 +453,12 @@ function startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientI
     execSync(`chown ${SANDBOX_USER}:${SANDBOX_USER} ${workDir}`);
   } catch {}
 
+  // ISSUE-014: the binary needs `codex exec resume <sid> <prompt>` (0.139.0+).
+  // Trim defensively; reject empty strings so a bad client doesn't silently
+  // downgrade to a fresh session.
+  const trimmedSession = (sessionId || '').toString().trim();
   const codexArgs = [
-    'exec',
+    trimmedSession ? 'exec' : 'exec',
     '--ignore-user-config',
     '-c', 'model_provider="newcli"',
     '-c', 'model_providers.newcli.name="newcli"',
@@ -417,7 +476,12 @@ function startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientI
     '-C', workDir,
   ];
   if (effectiveModel) codexArgs.push('-m', effectiveModel);
-  codexArgs.push(prompt);
+  if (trimmedSession) {
+    // Resume path: `codex exec resume <sid> <prompt>`
+    codexArgs.push('resume', trimmedSession, prompt);
+  } else {
+    codexArgs.push(prompt);
+  }
 
   const started = Date.now();
   const child = spawn(CODEX_BIN, codexArgs, {
@@ -436,7 +500,7 @@ function startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientI
       NO_COLOR: '1',
     },
   });
-  return { child, runId, workDir, started };
+  return { child, runId, workDir, started, sessionId: trimmedSession || null };
 }
 
 function readBody(req, maxBytes = 256 * 1024) {
@@ -639,6 +703,8 @@ async function handleRun(req, res) {
   const prompt    = (body.prompt || '').toString();
   const apiKey    = (body.apiKey || body.openaiApiKey || process.env.DEFAULT_OPENAI_API_KEY || '').toString();
   const model     = (body.model  || process.env.DEFAULT_MODEL || '').toString();
+  // ISSUE-014: optional sessionId to continue a previous conversation.
+  const sessionId = (body.sessionId || '').toString().trim() || null;
   const requestedTimeoutS = parseInt(body.timeoutSec || DEFAULT_TIMEOUT, 10) || DEFAULT_TIMEOUT;
   if (requestedTimeoutS > MAX_TIMEOUT) {
     return json(res, 400, { ok: false, error: 'bad_timeout', max: MAX_TIMEOUT });
@@ -661,6 +727,9 @@ async function handleRun(req, res) {
   // Build the codex command. Every config injected per-call via -c so no
   // shared on-disk state can drift between requests (codex was self-rewriting
   // config.toml with an outdated wire_api on cold start).
+  // ISSUE-014: when sessionId is present, the CLI invocation becomes
+  //   codex exec resume <sid> <prompt>
+  // — see startCodexJob; the args we build here mirror that path.
   const codexArgs = [
     'exec',
     '--ignore-user-config',                                  // do not read ~/.codex/config.toml
@@ -680,7 +749,11 @@ async function handleRun(req, res) {
     '-C', workDir,
   ];
   if (effectiveModel) codexArgs.push('-m', effectiveModel);
-  codexArgs.push(prompt);
+  if (sessionId) {
+    codexArgs.push('resume', sessionId, prompt);
+  } else {
+    codexArgs.push(prompt);
+  }
 
   const started = Date.now();
   const child = spawn(CODEX_BIN, codexArgs, {
@@ -716,18 +789,32 @@ async function handleRun(req, res) {
     const spawnMs   = firstByteMs ?? 0;             // ms from spawn to first byte (Rust cold start + handshake)
     const gatewayMs = firstByteMs != null ? Math.max(0, durationMs - firstByteMs) : 0; // model inference + retries
     const quotaExceeded = /\b(429|too many requests|rate[_ -]?limit)\b/i.test(stderr + stdout);
+    // ISSUE-014: pull the codex-assigned session id from the captured
+    // stdout/stderr. For a successful resume, the id equals the requested
+    // sessionId; for a failed resume (session not found / GC'd) the id
+    // will be missing or a new one. We expose both to the client and
+    // signal the fallback via `resumed: false` + `fallbackReason`.
+    const codexSessionId = parseCodexSessionId(stdout + '\n' + stderr);
+    const requestedSessionId = sessionId || null;
+    const resumedOk = !!requestedSessionId && code === 0 && !!codexSessionId && codexSessionId === requestedSessionId;
     try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
 
     let payload, status;
     if (killed) {
       status = 504;
-      payload = { ok: false, exitCode: 124, error: 'timeout', runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192) };
+      payload = { ok: false, exitCode: 124, error: 'timeout', runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
+        codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: resumedOk,
+        ...(requestedSessionId && !resumedOk ? { fallbackReason: 'session_not_found' } : {}) };
     } else if (code === 0) {
       status = 200;
-      payload = { ok: true, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192) };
+      payload = { ok: true, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
+        codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: resumedOk,
+        ...(requestedSessionId && !resumedOk ? { fallbackReason: 'session_not_found' } : {}) };
     } else {
       status = 502;
-      payload = { ok: false, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192) };
+      payload = { ok: false, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
+        codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
+        ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) };
     }
     json(res, status, payload);
 
@@ -738,6 +825,8 @@ async function handleRun(req, res) {
       durationMs, stdout: payload.stdout, stderr: payload.stderr,
       ok: !!payload.ok, error: payload.error || null,
       clientIp,
+      codexSessionId: codexSessionId || null,
+      parentSessionId: requestedSessionId,
     })).catch(e => console.error('[recordRun outer]', e.message));
   });
 
@@ -874,6 +963,12 @@ async function handleRunAsync(req, res) {
     statusUrl: '/job/' + job.id,
     eventsUrl: '/job/' + job.id + '/events',
     timeoutSec: timeoutS,
+    // ISSUE-014: surface the requested session id up-front so the client
+    // can correlate this job with a prior one. The actual codexSessionId
+    // (whether == requested for a successful resume, or a new one for a
+    // fallback) arrives in the `codexSession` SSE event when the run ends.
+    sessionId: spawn.sessionId || null,
+    resumed: false,    // resolved in the codexSession event on close
   });
 
   const killTimer = setTimeout(() => {
@@ -971,10 +1066,17 @@ async function handleRunAsync(req, res) {
     // decide whether the resume actually succeeded. For a successful
     // resume of session X, codex re-emits thread.started with the same
     // id; for a failed resume (session not found / GC'd), we either get
-    // no event or a different one.
-    const codexSessionId = parseCodexSessionId(job.stdout);
+    // no event or a different one. We treat a strict id match as
+    // "resumed" — anything else (missing, new, mismatch) becomes a
+    // fallback. Mirrors handleRun's logic.
+    const codexSessionId = parseCodexSessionId(job.stdout + '\n' + job.stderr);
     const requestedSessionId = spawn.sessionId || null;
-    const resumedOk = !!requestedSessionId && code === 0 && !!codexSessionId;
+    const resumedOk = !!requestedSessionId && code === 0 && !!codexSessionId && codexSessionId === requestedSessionId;
+    // ISSUE-014: stash resume outcome on the job for /job/:id status lookups.
+    job.codexSessionId = codexSessionId || null;
+    job.parentSessionId = requestedSessionId;
+    job.resumed = resumedOk;
+    job.fallbackReason = (requestedSessionId && !resumedOk) ? 'session_not_found' : null;
     try { fs.rmSync(spawn.workDir, { recursive: true, force: true }); } catch {}
 
     if (job.killed) {
@@ -982,16 +1084,22 @@ async function handleRunAsync(req, res) {
       job.ok = false;
       job.error = 'timeout';
       job.exitCode = 124;
-      emitJob(job, 'done', { ok: false, exitCode: 124, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, error: job.error, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192) });
+      emitJob(job, 'done', { ok: false, exitCode: 124, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, error: job.error, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+        codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
+        ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) });
     } else if (code === 0) {
       job.state = 'done';
       job.ok = true;
-      emitJob(job, 'done', { ok: true, exitCode: 0, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192) });
+      emitJob(job, 'done', { ok: true, exitCode: 0, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+        codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: resumedOk,
+        ...(requestedSessionId && !resumedOk ? { fallbackReason: 'session_not_found' } : {}) });
     } else {
       job.state = 'error';
       job.ok = false;
       job.error = 'codex exit ' + code;
-      emitJob(job, 'done', { ok: false, exitCode: code, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192) });
+      emitJob(job, 'done', { ok: false, exitCode: code, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+        codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
+        ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) });
     }
 
     // ISSUE-014: surface resume outcome to the client via a dedicated SSE
@@ -1026,6 +1134,8 @@ async function handleRunAsync(req, res) {
       stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
       ok: !!job.ok, error: job.error || null,
       clientIp,
+      codexSessionId: codexSessionId || null,
+      parentSessionId: requestedSessionId,
     })).catch(e => console.error('[recordRun async]', e.message));
     // ISSUE-013: free the concurrency slot; this drains the queue and grants
     // the next FIFO waiter their slot (activeCount--, then drainQueue()).
@@ -1066,6 +1176,13 @@ async function handleJobStatus(req, res, jobId) {
       stderrPreview: (job.stderr || '').slice(-2000),
       subscribers: job.subscribers,
       lastEvent: job.lastEvent || null,
+      // ISSUE-014: surface the resume outcome so a polling client can
+      // see `codexSessionId` / `resumed` / `fallbackReason` without
+      // having to subscribe to the SSE channel.
+      codexSessionId: job.codexSessionId || null,
+      parentSessionId: job.parentSessionId || null,
+      resumed: !!job.resumed,
+      fallbackReason: job.fallbackReason || null,
     });
   }
   // Memory miss → fall through to RDS (ISSUE-010). This is what makes
