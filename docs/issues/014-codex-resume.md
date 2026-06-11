@@ -14,21 +14,12 @@ risk: medium
 effort: medium
 expected_commits: 1
 ready_for_agent: true
-status: partial
-wontfix_reason: |
-  codex-cli 0.139.0 已具备 `codex exec resume <sid> <prompt>` 子命令(version check 通过,
-  `codex exec --help` 输出含 `Commands: resume ...`),CLI 路径并非阻塞。
-
-  本次仅落地 schema 加列 + 索引(`migrations/002_codex_runs_session.sql`),
-  服务端 `server/server.js` 的 startCodexJob / handleRun / handleRunAsync 改造
-  在 S2B 高并发窗口下被多个 ISSUE-013 协作者反复 rebase 掉,无法保证一次
-  Edit 在 stale read 期间不被对方覆盖。复盘见下方"Lessons"。
-
-  下一位 agent 接手时,先 `git fetch` + `git status`,确认 server.js HEAD
-  处于干净状态后再开新 worktree 实施 server.js 那部分;本 issue 文件保留
-  schema 与未完成的 server.js 改造描述,作为接续手册。
+status: done
+closed_at: 2026-06-12
+merged_commit: e0ccb62
 delivered_commits:
   - ISSUE-014-schema
+  - ISSUE-014-server
 ---
 
 # ISSUE-014: codex resume(sessionId 沿用)
