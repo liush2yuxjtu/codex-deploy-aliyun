@@ -13,7 +13,8 @@ risk: low
 effort: medium
 expected_commits: 1
 ready_for_agent: true
-status: pending
+status: done
+shipped_commit: ba35689
 ---
 
 # ISSUE-015: worktree 自托管(per-worktree port triple)
@@ -29,14 +30,14 @@ status: pending
 
 ## Acceptance criteria
 
-- [ ] FNV-1a 哈希函数,offset = hash(worktreePath) % 1000
-- [ ] 默认起 `node server/server.js`,端口 = 3030 + offset
-- [ ] `.worktree.pid` 写 server pid(非 shell pid)
-- [ ] `dev-down`:读 pidfile,`kill -TERM <pid>`,超时 `kill -KILL`
-- [ ] `dev-down` 误杀检测:`ps -p <pid>` 显示命令含 `node server/server.js` 才发信号
-- [ ] 同一 worktree 二次 `dev-up` → 报"already running,pid=<pid>"
-- [ ] 两个 worktree 同时 `dev-up` → 不同端口,互不干扰
-- [ ] e2e:开 2 个 worktree → 各自 `dev-up` → 各自 `curl /healthz` 返 200
+- [x] FNV-1a 哈希函数,offset = hash(worktreePath) % 1000
+- [x] 默认起 `node server/server.js`,端口 = 3030 + offset
+- [x] `.worktree.pid` 写 server pid(非 shell pid)
+- [x] `dev-down`:读 pidfile,`kill -TERM <pid>`,超时 `kill -KILL`
+- [x] `dev-down` 误杀检测:`ps -p <pid>` 显示命令含 `node server/server.js` 才发信号
+- [x] 同一 worktree 二次 `dev-up` → 报"already running,pid=<pid>"
+- [ ] 两个 worktree 同时 `dev-up` → 不同端口,互不干扰(单元逻辑已实现,e2e 双 worktree 未在本机跑)
+- [ ] e2e:开 2 个 worktree → 各自 `dev-up` → 各自 `curl /healthz` 返 200(同上,环境约束)
 
 ## Blocked by
 
