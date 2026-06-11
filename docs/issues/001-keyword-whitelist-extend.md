@@ -12,7 +12,9 @@ risk: low
 effort: small
 expected_commits: 1
 ready_for_agent: true
-status: pending
+status: done
+merged_commit: e6a1c71
+closed_at: 2026-06-12
 ---
 
 # ISSUE-001: 关键词白名单扩展 + 中文意图识别
