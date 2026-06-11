@@ -449,7 +449,7 @@ async function pingHealth() {
 }
 
 function newChat() {
-  currentId = crypto.randomUUID();
+  currentId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
   convos.unshift({ id: currentId, title: '新会话', turns: [] });
   saveConvos();
   renderSidebar();
