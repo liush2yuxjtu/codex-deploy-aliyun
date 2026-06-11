@@ -1126,6 +1126,8 @@ async function sendAsync(prompt, controller, assistantTurn, t0) {
     const s = JSON.parse(e.data);
     if (s.state === 'done' || s.state === 'error') {
       finish({ ok: !!s.ok, exitCode: s.exitCode, runId: s.runId, durationMs: s.durationMs, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs, quotaExceeded: s.quotaExceeded, error: s.error, stdout: s.stdoutPreview || '', stderr: s.stderrPreview || '' });
+    } else if (s.state === 'cancelled') {
+      finish({ ok: false, exitCode: s.exitCode != null ? s.exitCode : 130, runId: s.runId, durationMs: s.durationMs, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs, cancelled: true, cancelReason: s.cancelReason || 'user_cancelled' });
     } else {
       Object.assign(assistantTurn, { jobState: s.state, runId: s.runId, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs });
       renderChat();
@@ -1151,6 +1153,23 @@ async function sendAsync(prompt, controller, assistantTurn, t0) {
         finish({ ok: !!s.ok, exitCode: s.exitCode, runId: s.runId, durationMs: s.durationMs, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs, quotaExceeded: s.quotaExceeded, error: s.error, stdout: s.stdoutPreview || '', stderr: s.stderrPreview || '' });
       }
     }).catch(() => {});
+  });
+  // ISSUE-002: server-side confirmation that the job was killed.
+  // Treat exactly like `done` from the UI's perspective, but mark `cancelled`
+  // so the meta row shows the static "已取消" label instead of the live timer.
+  es.addEventListener('cancelled', (e) => {
+    let d = {};
+    try { d = JSON.parse(e.data || '{}'); } catch {}
+    finish({
+      ok: false,
+      exitCode: d.exitCode != null ? d.exitCode : 130,
+      runId: d.runId || init.runId,
+      durationMs: d.durationMs != null ? d.durationMs : (performance.now() - t0),
+      spawnMs: d.spawnMs,
+      gatewayMs: d.gatewayMs,
+      cancelled: true,
+      cancelReason: d.reason || 'user_cancelled',
+    });
   });
 
   // 3. Cancellation — closing the EventSource also gives the user a way out,
