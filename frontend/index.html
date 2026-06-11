@@ -647,7 +647,9 @@ function appendTurn(t) {
       const meta = document.createElement('div');
       meta.className = 'turn-meta';
       if (t.pending) {
-        meta.innerHTML = '<span class="badge live pending-elapsed">⏱ 0.0s</span>'
+        const jobBadge = t.async ? `<span class="badge" title="异步任务,可在 /job/${t.jobId} 查看">↻ ${t.jobState || 'pending'}</span>` : '';
+        meta.innerHTML = jobBadge
+          + '<span class="badge live pending-elapsed">⏱ 0.0s</span>'
           + '<span class="badge cancel" onclick="cancelRun()">✕ 取消</span>';
       } else if (t.isHistory) {
         // keep meta compact for history — banner already carries the key fields
@@ -909,6 +911,12 @@ async function sendMessage() {
   renderSidebar();
   renderChat();
 
+  // Detect "long-running skill" prompts — route to /run-async so we don't
+  // hit the 240s synchronous timeout when codex invokes skills like
+  // md-to-pdf-webfirst (URL fetch + Chromium render + multi-step workflow).
+  const ASYNC_RE = /(pdf|导出|export|render|渲染|生成.*pdf|pdf.*生成)/i;
+  const useAsync = ASYNC_RE.test(prompt);
+
   // live elapsed timer — updates the .pending-elapsed badge every 200ms
   const timerId = setInterval(() => {
     if (!assistantTurn.pending) { clearInterval(timerId); return; }
@@ -919,15 +927,19 @@ async function sendMessage() {
   const controller = new AbortController();
   activeController = controller;
   try {
-    const url = cfg.endpoint + '/run' + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ prompt, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}), timeoutSec: 120 }),
-      signal: controller.signal,
-    });
-    const j = await r.json();
-    Object.assign(assistantTurn, j, { pending: false, elapsedMs: performance.now() - t0 });
+    if (useAsync) {
+      await sendAsync(prompt, controller, assistantTurn, t0);
+    } else {
+      const url = cfg.endpoint + '/run' + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}), timeoutSec: 120 }),
+        signal: controller.signal,
+      });
+      const j = await r.json();
+      Object.assign(assistantTurn, j, { pending: false, elapsedMs: performance.now() - t0 });
+    }
   } catch (e) {
     const cancelled = e.name === 'AbortError';
     Object.assign(assistantTurn, {
@@ -941,6 +953,75 @@ async function sendMessage() {
   saveConvos();
   renderChat();
   fetchHistory();  // refresh cloud history after each /run
+}
+
+// Async path: POST /run-async → subscribe to /job/:id/events via EventSource.
+// Updates the turn card live with the job's state and final result.
+async function sendAsync(prompt, controller, assistantTurn, t0) {
+  // 1. POST /run-async (short round-trip — server returns 202 + jobId)
+  const submitUrl = cfg.endpoint + '/run-async' + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
+  const initResp = await fetch(submitUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}), timeoutSec: 240 }),
+    signal: controller.signal,
+  });
+  if (!initResp.ok) {
+    const txt = await initResp.text();
+    throw new Error('submit failed: HTTP ' + initResp.status + ' — ' + txt.slice(0, 200));
+  }
+  const init = await initResp.json();
+  if (!init.async || !init.jobId) throw new Error('server did not return async jobId');
+  Object.assign(assistantTurn, { pending: true, jobId: init.jobId, async: true, runId: init.runId });
+  renderChat();
+
+  // 2. EventSource against /job/:id/events (SSE) — gives us live progress
+  const eventsUrl = (cfg.endpoint + init.eventsUrl) + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
+  const es = new EventSource(eventsUrl);
+  let done = false;
+  const finish = (payload) => {
+    if (done) return;
+    done = true;
+    try { es.close(); } catch {}
+    Object.assign(assistantTurn, payload, { pending: false, elapsedMs: performance.now() - t0 });
+    renderChat();
+  };
+  es.addEventListener('snapshot', (e) => {
+    const s = JSON.parse(e.data);
+    if (s.state === 'done' || s.state === 'error') {
+      finish({ ok: !!s.ok, exitCode: s.exitCode, runId: s.runId, durationMs: s.durationMs, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs, quotaExceeded: s.quotaExceeded, error: s.error, stdout: s.stdoutPreview || '', stderr: s.stderrPreview || '' });
+    } else {
+      Object.assign(assistantTurn, { jobState: s.state, runId: s.runId, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs });
+      renderChat();
+    }
+  });
+  es.addEventListener('start', () => { assistantTurn.jobState = 'running'; renderChat(); });
+  es.addEventListener('running', () => { assistantTurn.jobState = 'running'; renderChat(); });
+  es.addEventListener('firstByte', (e) => {
+    const d = JSON.parse(e.data);
+    assistantTurn.spawnMs = d.spawnMs;
+    renderChat();
+  });
+  es.addEventListener('done', (e) => {
+    const d = JSON.parse(e.data);
+    finish({ ok: !!d.ok, exitCode: d.exitCode, runId: init.runId, durationMs: d.durationMs, spawnMs: d.spawnMs, gatewayMs: d.gatewayMs, quotaExceeded: d.quotaExceeded, error: d.error, stdout: d.stdout || '', stderr: d.stderr || '' });
+  });
+  es.addEventListener('error', (e) => {
+    // EventSource auto-reconnects on transient errors. Only treat as fatal
+    // if the job is gone. We fall back to a one-shot status poll.
+    if (done) return;
+    fetch(cfg.endpoint + '/job/' + assistantTurn.jobId).then(r => r.json()).then(s => {
+      if (s.state === 'done' || s.state === 'error') {
+        finish({ ok: !!s.ok, exitCode: s.exitCode, runId: s.runId, durationMs: s.durationMs, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs, quotaExceeded: s.quotaExceeded, error: s.error, stdout: s.stdoutPreview || '', stderr: s.stderrPreview || '' });
+      }
+    }).catch(() => {});
+  });
+
+  // 3. Cancellation — closing the EventSource also gives the user a way out,
+  // but we don't kill the server-side job (the timeout will eventually).
+  // If the user clicks "取消", we close ES and mark the turn as cancelled.
+  // The server job keeps running until its killTimer fires.
+  controller.signal.addEventListener('abort', () => { es.close(); });
 }
 
 const pdfDrop = document.getElementById('pdf-drop');

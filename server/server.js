@@ -96,6 +96,78 @@ try {
 const DEFAULT_TIMEOUT = 90;
 const MAX_TIMEOUT     = 240;
 
+// ─── async /run: in-memory job store + per-job EventEmitter for SSE ───
+const JOBS = new Map();              // jobId -> { state, emitter, ... }
+const JOBS_TTL_MS = 60 * 60 * 1000;  // GC finished jobs after 1h
+
+function newJobId() { return randomUUID(); }
+function makeJob(initial) {
+  const emitter = new (require('events'))();
+  const job = { ...initial, emitter, subscribers: 0 };
+  JOBS.set(job.id, job);
+  return job;
+}
+function emitJob(job, type, payload) {
+  const evt = { type, ts: Date.now(), ...payload };
+  job.lastEvent = evt;
+  job.emitter.emit('event', evt);
+}
+function gcJob(job) {
+  setTimeout(() => { if (JOBS.get(job.id) === job) JOBS.delete(job.id); }, JOBS_TTL_MS).unref();
+}
+
+// Shared spawn helper used by both handleRun (sync) and handleRunAsync.
+// Returns { child, runId, workDir, started, firstBytePromise }.
+function startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientIp }) {
+  const runId = randomUUID();
+  const workDir = path.join(RUN_BASE, runId);
+  fs.mkdirSync(workDir, { recursive: true, mode: 0o770 });
+  try {
+    const { execSync } = require('child_process');
+    execSync(`chown ${SANDBOX_USER}:${SANDBOX_USER} ${workDir}`);
+  } catch {}
+
+  const codexArgs = [
+    'exec',
+    '--ignore-user-config',
+    '-c', 'model_provider="newcli"',
+    '-c', 'model_providers.newcli.name="newcli"',
+    '-c', 'model_providers.newcli.base_url="https://code.newcli.com/codex/v1"',
+    '-c', 'model_providers.newcli.wire_api="responses"',
+    '-c', 'model_providers.newcli.env_key="LLM_API_KEY"',
+    '-c', 'model_providers.newcli.request_max_retries=1',
+    '-c', 'model_providers.newcli.stream_max_retries=1',
+    '-c', 'disable_response_storage=true',
+    '-c', 'approval_policy="never"',
+    '-s', 'workspace-write',
+    '--skip-git-repo-check',
+    '--ephemeral',
+    '--color', 'never',
+    '-C', workDir,
+  ];
+  if (effectiveModel) codexArgs.push('-m', effectiveModel);
+  codexArgs.push(prompt);
+
+  const started = Date.now();
+  const child = spawn(CODEX_BIN, codexArgs, {
+    uid: SANDBOX_UID,
+    gid: SANDBOX_GID,
+    cwd: workDir,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      PATH: '/opt/node-v20.18.1-linux-x64/bin:/usr/local/bin:/usr/bin:/bin',
+      HOME: `/home/${SANDBOX_USER}`,
+      USER: SANDBOX_USER,
+      LLM_API_KEY: effectiveKey,
+      OPENAI_API_KEY: effectiveKey,
+      TERM: 'dumb',
+      NO_COLOR: '1',
+    },
+  });
+  return { child, runId, workDir, started };
+}
+
 function readBody(req, maxBytes = 256 * 1024) {
   return new Promise((resolve, reject) => {
     let n = 0, chunks = [];
@@ -401,6 +473,184 @@ async function handleRun(req, res) {
   });
 }
 
+// ─── async /run: long-running skill calls (PDF render, web fetch, etc.) ───
+// Returns 202 + { jobId, statusUrl, eventsUrl } immediately; client polls
+// /job/:id or subscribes to /job/:id/events for live progress.
+async function handleRunAsync(req, res) {
+  const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim() || null;
+  const raw = await readBody(req);
+  let body;
+  try { body = JSON.parse(raw || '{}'); } catch { return json(res, 400, { ok: false, error: 'bad json' }); }
+  const prompt    = (body.prompt || '').toString();
+  const apiKey    = (body.apiKey || body.openaiApiKey || process.env.DEFAULT_OPENAI_API_KEY || '').toString();
+  const model     = (body.model  || process.env.DEFAULT_MODEL || '').toString();
+  const timeoutS  = Math.min(parseInt(body.timeoutSec || MAX_TIMEOUT, 10) || MAX_TIMEOUT, MAX_TIMEOUT);
+  if (!prompt) return json(res, 400, { ok: false, error: 'missing prompt' });
+  const effectiveKey = apiKey || SERVER_LLM_API_KEY;
+  if (!effectiveKey) return json(res, 400, { ok: false, error: 'missing apiKey: neither request body nor server has one' });
+  const effectiveModel = model || SERVER_LLM_DEFAULT_MODEL || '';
+
+  const job = makeJob({
+    id: newJobId(),
+    state: 'pending',                 // pending -> running -> done|error
+    prompt, model: effectiveModel || null,
+    started: Date.now(), finished: null,
+    runId: null, exitCode: null, ok: null,
+    spawnMs: 0, gatewayMs: 0, quotaExceeded: false,
+    error: null, stdout: '', stderr: '',
+    clientIp,
+  });
+  gcJob(job);
+
+  let spawn;
+  try {
+    spawn = startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientIp });
+  } catch (e) {
+    job.state = 'error';
+    job.error = String(e && e.message || e);
+    job.finished = Date.now();
+    emitJob(job, 'error', { error: job.error });
+    return json(res, 500, { ok: false, jobId: job.id, error: job.error });
+  }
+  job.runId = spawn.runId;
+  job.state = 'running';
+  emitJob(job, 'start', { runId: spawn.runId, startedAt: spawn.started });
+  emitJob(job, 'running', {});
+
+  // respond 202 with the handles BEFORE we wait for the child
+  json(res, 202, {
+    ok: true, async: true, jobId: job.id, runId: spawn.runId,
+    statusUrl: '/job/' + job.id,
+    eventsUrl: '/job/' + job.id + '/events',
+    timeoutSec: timeoutS,
+  });
+
+  const killTimer = setTimeout(() => {
+    job.killed = true;
+    try { process.kill(-spawn.child.pid, 'SIGKILL'); }
+    catch (e) { try { spawn.child.kill('SIGKILL'); } catch {} }
+  }, timeoutS * 1000);
+  killTimer.unref();
+
+  let firstByteMs = null;
+  spawn.child.stdout.on('data', c => {
+    if (firstByteMs === null) {
+      firstByteMs = Date.now() - spawn.started;
+      job.spawnMs = firstByteMs;
+      emitJob(job, 'firstByte', { spawnMs: firstByteMs });
+    }
+    job.stdout += c.toString('utf8');
+    job.stdoutBytes = job.stdout.length;
+  });
+  spawn.child.stderr.on('data', c => {
+    if (firstByteMs === null) {
+      firstByteMs = Date.now() - spawn.started;
+      job.spawnMs = firstByteMs;
+      emitJob(job, 'firstByte', { spawnMs: firstByteMs });
+    }
+    job.stderr += c.toString('utf8');
+    job.stderrBytes = job.stderr.length;
+  });
+
+  spawn.child.on('close', (code) => {
+    clearTimeout(killTimer);
+    const durationMs = Date.now() - spawn.started;
+    job.finished = Date.now();
+    job.durationMs = durationMs;
+    job.gatewayMs = firstByteMs != null ? Math.max(0, durationMs - firstByteMs) : 0;
+    job.quotaExceeded = /\b(429|too many requests|rate[_ -]?limit)\b/i.test(job.stderr + job.stdout);
+    job.exitCode = code;
+    try { fs.rmSync(spawn.workDir, { recursive: true, force: true }); } catch {}
+
+    if (job.killed) {
+      job.state = 'error';
+      job.ok = false;
+      job.error = 'timed out after ' + timeoutS + 's';
+      emitJob(job, 'done', { ok: false, exitCode: null, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, error: job.error, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192) });
+    } else if (code === 0) {
+      job.state = 'done';
+      job.ok = true;
+      emitJob(job, 'done', { ok: true, exitCode: 0, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192) });
+    } else {
+      job.state = 'error';
+      job.ok = false;
+      job.error = 'codex exit ' + code;
+      emitJob(job, 'done', { ok: false, exitCode: code, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192) });
+    }
+
+    // fire-and-forget persistence (same shape as handleRun)
+    Promise.resolve().then(() => recordRun({
+      runId: spawn.runId, prompt, model: effectiveModel || null,
+      exitCode: job.exitCode, durationMs,
+      stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+      ok: !!job.ok, error: job.error || null,
+      clientIp,
+    })).catch(e => console.error('[recordRun async]', e.message));
+  });
+
+  spawn.child.on('error', (e) => {
+    clearTimeout(killTimer);
+    job.state = 'error';
+    job.ok = false;
+    job.error = String(e && e.message || e);
+    job.finished = Date.now();
+    try { fs.rmSync(spawn.workDir, { recursive: true, force: true }); } catch {}
+    emitJob(job, 'error', { error: job.error });
+  });
+}
+
+function handleJobStatus(req, res, jobId) {
+  const job = JOBS.get(jobId);
+  if (!job) return json(res, 404, { ok: false, error: 'job not found or expired' });
+  json(res, 200, {
+    ok: true, jobId: job.id, state: job.state, runId: job.runId,
+    prompt: job.prompt, model: job.model, started: job.started, finished: job.finished,
+    durationMs: job.durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs,
+    quotaExceeded: job.quotaExceeded, exitCode: job.exitCode, ok: job.ok, error: job.error,
+    stdoutPreview: (job.stdout || '').slice(-4000),
+    stderrPreview: (job.stderr || '').slice(-2000),
+    subscribers: job.subscribers,
+    lastEvent: job.lastEvent || null,
+  });
+}
+
+// SSE: stream job events. The first event is always a 'snapshot' with the
+// current state, so a late subscriber doesn't miss the start.
+function handleJobEvents(req, res, jobId) {
+  const job = JOBS.get(jobId);
+  if (!job) return json(res, 404, { ok: false, error: 'job not found or expired' });
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  const write = (type, data) => {
+    try { res.write('event: ' + type + '\ndata: ' + JSON.stringify(data) + '\n\n'); } catch {}
+  };
+  // initial snapshot
+  write('snapshot', {
+    jobId: job.id, state: job.state, runId: job.runId,
+    started: job.started, finished: job.finished,
+    durationMs: job.durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs,
+    quotaExceeded: job.quotaExceeded, exitCode: job.exitCode, ok: job.ok, error: job.error,
+  });
+  const onEvent = (evt) => write(evt.type, evt);
+  job.emitter.on('event', onEvent);
+  job.subscribers++;
+  // keepalive ping every 25s
+  const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
+  const cleanup = () => {
+    clearInterval(ping);
+    job.emitter.off('event', onEvent);
+    job.subscribers = Math.max(0, job.subscribers - 1);
+    try { res.end(); } catch {}
+  };
+  req.on('close', cleanup);
+  req.on('aborted', cleanup);
+}
+
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'content-type, x-demo-key');
@@ -446,6 +696,19 @@ const server = http.createServer(async (req, res) => {
     if (!CODEX_AVAILABLE) return json(res, 503, { ok: false, error: 'codex binary or sandbox user not present on this host' });
     try { return await handleRun(req, res); }
     catch (e) { return json(res, 500, { ok: false, error: String(e && e.message || e) }); }
+  }
+  if (req.method === 'POST' && url.pathname === '/run-async') {
+    if (!checkAuth(req)) return json(res, 401, { ok: false, error: 'unauthorized (pass x-demo-key header or ?key=)' });
+    if (!CODEX_AVAILABLE) return json(res, 503, { ok: false, error: 'codex binary or sandbox user not present on this host' });
+    try { return await handleRunAsync(req, res); }
+    catch (e) { return json(res, 500, { ok: false, error: String(e && e.message || e) }); }
+  }
+  // /job/:id  and  /job/:id/events  — async job state + SSE
+  const jobMatch = url.pathname.match(/^\/job\/([0-9a-f-]{36})(?:\/events)?$/);
+  if (req.method === 'GET' && jobMatch) {
+    const jobId = jobMatch[1];
+    if (url.pathname.endsWith('/events')) return handleJobEvents(req, res, jobId);
+    return handleJobStatus(req, res, jobId);
   }
   // ─── /pdf: URL or local path → PDF via md-to-pdf-webfirst skill ───
   if (req.method === 'POST' && (url.pathname === '/pdf' || url.pathname === '/pdf/from-url')) {
