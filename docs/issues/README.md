@@ -119,3 +119,4 @@ graph TD
 
 <!-- 完成一条 issue 后,在本节加一行 -->
 <!-- - ISSUE-NNN <title> (<sha>) — <date> — agent: <name> -->
+- ISSUE-003 timeoutSec 前端下拉(5399f7c) — 2026-06-12 — agent: codex

@@ -12,7 +12,9 @@ risk: low
 effort: small
 expected_commits: 1
 ready_for_agent: true
-status: pending
+status: done
+merged_commit: 5399f7c
+closed_at: 2026-06-12
 ---
 
 # ISSUE-003: timeoutSec 前端下拉(60/120/300/600s)
@@ -23,11 +25,11 @@ status: pending
 
 ## Acceptance criteria
 
-- [ ] 聊天模式下拉显示 4 个选项,默认 120s
-- [ ] PDF 模式(tablist 切到 PDF)下拉默认切到 300s
-- [ ] 选中值随请求体发出,字段名 `timeoutSec`
-- [ ] 下拉 UI 风格与现有 ChatGPT 风格一致(no 新依赖)
-- [ ] e2e:在 chat 模式选 600s → curl 抓包 `POST /run` 看到 `timeoutSec: 600`
+- [x] 聊天模式下拉显示 4 个选项,默认 120s
+- [x] PDF 模式(tablist 切到 PDF)下拉默认切到 300s
+- [x] 选中值随请求体发出,字段名 `timeoutSec`
+- [x] 下拉 UI 风格与现有 ChatGPT 风格一致(no 新依赖)
+- [x] e2e:在 chat 模式选 600s → curl 抓包 `POST /run` 看到 `timeoutSec: 600`
 
 ## Blocked by
 
