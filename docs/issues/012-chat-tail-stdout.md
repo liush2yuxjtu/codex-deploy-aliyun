@@ -14,7 +14,9 @@ risk: low
 effort: small
 expected_commits: 1
 ready_for_agent: true
-status: pending
+status: done
+merged_commit: e04f0fa
+closed_at: 2026-06-12
 ---
 
 # ISSUE-012: 异步任务 chat tail 日志流
