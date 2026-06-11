@@ -9,11 +9,14 @@ soft_blocked_by: []
 files:
   - scripts/rotate_credentials.sh
   - .env.example
+  - .gitignore
 risk: medium
 effort: medium
 expected_commits: 2
 ready_for_agent: true
-status: pending
+status: done
+closed_at: 2026-06-12
+merged_commit: d70fcc8
 ---
 
 # ISSUE-006: 凭据轮换脚本(LLM/RDS/AccessKey/SSH)
