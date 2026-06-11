@@ -13,7 +13,7 @@ risk: medium
 effort: large
 expected_commits: 2
 ready_for_agent: true
-status: pending
+status: done
 ---
 
 # ISSUE-010: codex_jobs 表 + 内存/RDS 双读
