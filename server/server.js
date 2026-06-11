@@ -94,7 +94,7 @@ try {
   console.log('[codex-api] sandbox user ' + SANDBOX_USER + ' not present — /run disabled, /pdf still works');
 }
 const DEFAULT_TIMEOUT = 90;
-const MAX_TIMEOUT     = 240;
+const MAX_TIMEOUT     = 900;
 
 // ─── async /run: in-memory job store + per-job EventEmitter for SSE ───
 const JOBS = new Map();              // jobId -> { state, emitter, ... }
@@ -114,6 +114,64 @@ function emitJob(job, type, payload) {
 }
 function gcJob(job) {
   setTimeout(() => { if (JOBS.get(job.id) === job) JOBS.delete(job.id); }, JOBS_TTL_MS).unref();
+}
+
+// ─── killJobTree: SIGTERM → wait gracefulMs → SIGKILL on the process group ───
+// Used by ISSUE-002/004/013/014. codex's Rust binary detaches from the JS
+// launcher, so we must signal the process group (negative pid), see
+// reference-deployment-gotchas #6. Pure helper: no side-effects on JOBS.
+async function killJobTree(child, { gracefulMs = 5000, jobId = '-', reason = 'user' } = {}) {
+  if (!child) {
+    return { killed: false, reason: 'no_child' };
+  }
+  const pid = child.pid;
+  const log = (sig, why) => console.log(`[killJobTree] job=${jobId} pid=${pid} sig=${sig} reason=${why}`);
+
+  // Helper: signal the process group; fall back to direct kill if the group
+  // is gone. Bubbles ESRCH so the caller can map to "already_dead".
+  const signal = (sig) => {
+    try { process.kill(-pid, sig); return 'pg'; }
+    catch (e) {
+      if (e && e.code === 'ESRCH') throw e;
+      try { child.kill(sig); return 'direct'; }
+      catch (e2) { if (e2 && e2.code === 'ESRCH') throw e2; throw e2; }
+    }
+  };
+
+  // 1) try SIGTERM
+  try { signal('SIGTERM'); }
+  catch (e) {
+    if (e && e.code === 'ESRCH') {
+      log('TERM', 'already_dead');
+      return { killed: false, reason: 'already_dead' };
+    }
+    throw e;
+  }
+  log('TERM', reason);
+
+  // 2) wait for graceful exit, capped at gracefulMs
+  const exited = await new Promise((resolve) => {
+    let done = false;
+    const finish = (how) => { if (done) return; done = true; clearTimeout(t); resolve(how); };
+    const t = setTimeout(() => finish('timeout'), gracefulMs);
+    child.once('exit', () => finish('exit'));
+  });
+
+  if (exited === 'exit') {
+    return { killed: true, sig: 'TERM' };
+  }
+
+  // 3) graceful timed out → SIGKILL the group
+  try { signal('SIGKILL'); }
+  catch (e) {
+    if (e && e.code === 'ESRCH') {
+      log('KILL', 'already_dead');
+      return { killed: false, reason: 'already_dead' };
+    }
+    throw e;
+  }
+  log('KILL', 'timeout');
+  return { killed: true, sig: 'KILL' };
 }
 
 // Shared spawn helper used by both handleRun (sync) and handleRunAsync.
