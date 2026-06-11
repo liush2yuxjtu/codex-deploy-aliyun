@@ -13,7 +13,9 @@ risk: medium
 effort: medium
 expected_commits: 1
 ready_for_agent: true
-status: pending
+status: done
+closed_at: 2026-06-12
+merged_commit: e3b3eb2
 ---
 
 # ISSUE-013: 并发信号量 + FIFO 队列(MAX_CONCURRENT_CODEX)

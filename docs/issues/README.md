@@ -121,3 +121,4 @@ graph TD
 <!-- - ISSUE-NNN <title> (<sha>) — <date> — agent: <name> -->
 - ISSUE-003 timeoutSec 前端下拉(5399f7c) — 2026-06-12 — agent: codex
 - ISSUE-012 异步任务 chat tail 日志流(e04f0fa) — 2026-06-12 — agent: codex
+- ISSUE-013 并发信号量 + FIFO 队列(e3b3eb2) — 2026-06-12 — agent: codex
