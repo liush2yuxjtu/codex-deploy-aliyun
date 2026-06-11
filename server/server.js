@@ -130,6 +130,32 @@ async function updateCodexJobTerminal(row) {
   }
 }
 
+// Mid-flight status update (e.g. queued → running). Used by the ISSUE-013
+// semaphore to flip the RDS row when a queued job gets a slot and spawns.
+// stdout_path / stderr_path are also updatable so a queued placeholder can
+// be replaced by the real per-run workDir paths.
+async function updateCodexJobStatus(row) {
+  if (!pgPool) return;
+  try {
+    await pgPool.query(
+      `UPDATE codex_jobs
+          SET status        = $2,
+              last_event_ts = $3,
+              stdout_path   = COALESCE($4, stdout_path),
+              stderr_path   = COALESCE($5, stderr_path)
+        WHERE job_id = $1`,
+      [
+        row.jobId, row.status,
+        row.lastEventTs ?? Date.now(),
+        row.stdoutPath ?? null,
+        row.stderrPath ?? null,
+      ]
+    );
+  } catch (e) {
+    console.error('[codexJobs] status update failed:', e.message);
+  }
+}
+
 // Re-hydrate a read-only job snapshot from RDS for /job/:id on a memory miss.
 // Returns null if the row doesn't exist or the DB is unavailable. The returned
 // shape mirrors what handleJobStatus writes back (emitter=null, no event
@@ -232,6 +258,75 @@ function emitJob(job, type, payload) {
 }
 function gcJob(job) {
   setTimeout(() => { if (JOBS.get(job.id) === job) JOBS.delete(job.id); }, JOBS_TTL_MS).unref();
+}
+
+// ─── concurrency semaphore + FIFO queue (ISSUE-013) ───
+// Cap concurrent codex jobs to MAX_CONCURRENT_CODEX (default 3, env).
+// Excess requests join a FIFO queue of MAX_QUEUE_SIZE (default 6, env).
+// Queue entries that wait more than MAX_QUEUE_WAIT_MS (30s) are rejected
+// with 503 queue_timeout; their child (if any) is killed via killJobTree.
+const MAX_CONCURRENT_CODEX = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CODEX || '3', 10) || 3);
+const MAX_QUEUE_SIZE       = Math.max(0, parseInt(process.env.MAX_QUEUE_SIZE || '6', 10) || 6);
+const MAX_QUEUE_WAIT_MS    = 30 * 1000;
+let activeCount = 0;
+const queue = [];   // [{ jobId, resolve, reject, timer, queuedAt }]
+
+function tryAcquireSlot() {
+  if (activeCount < MAX_CONCURRENT_CODEX) {
+    activeCount += 1;
+    return { acquired: true, mode: 'running' };
+  }
+  if (queue.length >= MAX_QUEUE_SIZE) {
+    return { acquired: false, mode: 'rejected', reason: 'queue_full' };
+  }
+  return { acquired: false, mode: 'queued' };
+}
+function waitForSlot({ jobId }) {
+  return new Promise((resolve, reject) => {
+    const entry = { jobId, resolve, reject, queuedAt: Date.now(), timer: null };
+    entry.timer = setTimeout(() => {
+      const idx = queue.indexOf(entry);
+      if (idx === -1) return;
+      queue.splice(idx, 1);
+      const e = new Error('queue timeout after ' + MAX_QUEUE_WAIT_MS + 'ms');
+      e.queueReason = 'queue_timeout';
+      e.queueWaitMs = Date.now() - entry.queuedAt;
+      reject(e);
+    }, MAX_QUEUE_WAIT_MS);
+    entry.timer.unref?.();
+    queue.push(entry);
+  });
+}
+function drainQueue() {
+  while (activeCount < MAX_CONCURRENT_CODEX && queue.length > 0) {
+    const next = queue.shift();
+    if (next.timer) clearTimeout(next.timer);
+    activeCount += 1;
+    next.resolve({ mode: 'running' });
+  }
+}
+function releaseSlot() {
+  if (activeCount > 0) activeCount -= 1;
+  drainQueue();
+}
+function cancelQueueWait(jobId, reason = 'cancelled') {
+  const idx = queue.findIndex(e => e.jobId === jobId);
+  if (idx === -1) return false;
+  const entry = queue.splice(idx, 1)[0];
+  if (entry.timer) clearTimeout(entry.timer);
+  const e = new Error('queue wait cancelled: ' + reason);
+  e.queueReason = reason;
+  entry.reject(e);
+  return true;
+}
+function queueStats() {
+  return {
+    active: activeCount,
+    queued: queue.length,
+    maxConcurrent: MAX_CONCURRENT_CODEX,
+    maxQueue: MAX_QUEUE_SIZE,
+    maxQueueWaitMs: MAX_QUEUE_WAIT_MS,
+  };
 }
 
 // ─── killJobTree: SIGTERM → wait gracefulMs → SIGKILL on the process group ───
@@ -688,6 +783,65 @@ async function handleRunAsync(req, res) {
   });
   gcJob(job);
 
+  // ISSUE-013: acquire a concurrency slot. If the semaphore is full, the
+  // request joins the FIFO queue (or is rejected with 503 queue_full if the
+  // queue itself is at MAX_QUEUE_SIZE). Queue entries that wait longer than
+  // MAX_QUEUE_WAIT_MS are rejected with 503 queue_timeout.
+  const acquire = tryAcquireSlot();
+  if (!acquire.acquired && acquire.mode === 'rejected') {
+    res.setHeader('Retry-After', '10');
+    return json(res, 503, { ok: false, error: 'queue_full', queue: queueStats() });
+  }
+  const startedQueued = acquire.mode === 'queued';
+  if (startedQueued) job.state = 'queued';
+  const placeholderStdout = path.join(RUN_BASE, '__pending__', job.id, 'stdout.log');
+  const placeholderStderr = path.join(RUN_BASE, '__pending__', job.id, 'stderr.log');
+  Promise.resolve().then(() => insertCodexJob({
+    jobId: job.id,
+    status: startedQueued ? 'queued' : 'running',
+    prompt: job.prompt,
+    model: job.model,
+    startedAt: job.started,
+    lastEventTs: Date.now(),
+    stdoutPath: placeholderStdout,
+    stderrPath: placeholderStderr,
+    clientIp,
+  })).catch(e => console.error('[codexJobs insert outer]', e.message));
+
+  if (startedQueued) {
+    const pos = queue.length + 1;
+    emitJob(job, 'queued', { position: pos, maxConcurrent: MAX_CONCURRENT_CODEX, maxQueue: MAX_QUEUE_SIZE, maxQueueWaitMs: MAX_QUEUE_WAIT_MS });
+    json(res, 202, {
+      ok: true, async: true, jobId: job.id,
+      state: 'queued', queuePosition: pos,
+      statusUrl: '/job/' + job.id,
+      eventsUrl: '/job/' + job.id + '/events',
+      timeoutSec: timeoutS,
+    });
+    let grant;
+    try {
+      grant = await waitForSlot({ jobId: job.id });
+    } catch (e) {
+      await killJobTree(null, { jobId: job.id, reason: 'queue_timeout' });
+      job.state = 'error';
+      job.ok = false;
+      job.error = e.queueReason || 'queue_timeout';
+      job.finished = Date.now();
+      job.exitCode = null;
+      emitJob(job, 'error', { error: job.error, queueReason: e.queueReason, queueWaitMs: e.queueWaitMs });
+      Promise.resolve().then(() => updateCodexJobTerminal({
+        jobId: job.id,
+        status: 'cancelled',
+        finishedAt: job.finished,
+        durationMs: null,
+        exitCode: null,
+        lastEventTs: Date.now(),
+      })).catch(err => console.error('[codexJobs update outer]', err.message));
+      return;
+    }
+    void grant;
+  }
+
   let spawn;
   try {
     spawn = startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientIp, sessionId });
@@ -696,6 +850,7 @@ async function handleRunAsync(req, res) {
     job.error = String(e && e.message || e);
     job.finished = Date.now();
     emitJob(job, 'error', { error: job.error });
+    releaseSlot();
     return json(res, 500, { ok: false, jobId: job.id, error: job.error });
   }
   job.runId = spawn.runId;
@@ -703,21 +858,15 @@ async function handleRunAsync(req, res) {
   emitJob(job, 'start', { runId: spawn.runId, startedAt: spawn.started });
   emitJob(job, 'running', {});
 
-  // Best-effort: persist the row to codex_jobs so /job/:id survives a restart.
-  // stdout/stderr stay in the per-run workDir; RDS only stores their paths.
-  // The pre-filled paths mean a row exists even if the process dies before
-  // the close handler runs (so the ISSUE-010 memory-miss path can rebuild it).
-  Promise.resolve().then(() => insertCodexJob({
+  // The row was INSERTed earlier (queued or running) at semaphore time.
+  // Best-effort: a failure here only degrades the ISSUE-010 reload path.
+  Promise.resolve().then(() => updateCodexJobStatus({
     jobId: job.id,
     status: 'running',
-    prompt: job.prompt,
-    model: job.model,
-    startedAt: job.started,
     lastEventTs: Date.now(),
     stdoutPath: path.join(spawn.workDir, 'stdout.log'),
     stderrPath: path.join(spawn.workDir, 'stderr.log'),
-    clientIp,
-  })).catch(e => console.error('[codexJobs insert outer]', e.message));
+  })).catch(e => console.error('[codexJobs status update outer]', e.message));
 
   // respond 202 with the handles BEFORE we wait for the child
   json(res, 202, {
@@ -878,6 +1027,9 @@ async function handleRunAsync(req, res) {
       ok: !!job.ok, error: job.error || null,
       clientIp,
     })).catch(e => console.error('[recordRun async]', e.message));
+    // ISSUE-013: free the concurrency slot; this drains the queue and grants
+    // the next FIFO waiter their slot (activeCount--, then drainQueue()).
+    releaseSlot();
   });
 
   spawn.child.on('error', (e) => {
@@ -897,6 +1049,8 @@ async function handleRunAsync(req, res) {
       exitCode: job.exitCode ?? null,
       lastEventTs: Date.now(),
     })).catch(e => console.error('[codexJobs update outer]', e.message));
+    // ISSUE-013: free the concurrency slot.
+    releaseSlot();
   });
 }
 
