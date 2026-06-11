@@ -914,8 +914,20 @@ async function sendMessage() {
   // Detect "long-running skill" prompts — route to /run-async so we don't
   // hit the 240s synchronous timeout when codex invokes skills like
   // md-to-pdf-webfirst (URL fetch + Chromium render + multi-step workflow).
-  const ASYNC_RE = /(pdf|导出|export|render|渲染|生成.*pdf|pdf.*生成)/i;
+  // Keyword list is hot-swappable via window.__codexAsyncKeywords so devtools
+  // can tune the whitelist without reloading.  Tightening strategy: keep
+  // "PDF 主题词 + 至少一个动词" so generic chat doesn't fall through.
+  if (!Array.isArray(window.__codexAsyncKeywords)) {
+    window.__codexAsyncKeywords = [
+      'pdf', '导出', 'export', 'render', '渲染',
+      '生成.*pdf', '做.*pdf', '转.*pdf', '弄.*pdf', '\\.pdf',
+    ];
+  }
+  const ASYNC_RE = new RegExp(window.__codexAsyncKeywords.join('|'), 'i');
   const useAsync = ASYNC_RE.test(prompt);
+  if (!useAsync) {
+    console.warn(prompt.slice(0, 30) + ' fell through to sync');
+  }
 
   // live elapsed timer — updates the .pending-elapsed badge every 200ms
   const timerId = setInterval(() => {
