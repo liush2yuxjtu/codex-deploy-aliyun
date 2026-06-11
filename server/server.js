@@ -426,7 +426,11 @@ async function handleRun(req, res) {
   const prompt    = (body.prompt || '').toString();
   const apiKey    = (body.apiKey || body.openaiApiKey || process.env.DEFAULT_OPENAI_API_KEY || '').toString();
   const model     = (body.model  || process.env.DEFAULT_MODEL || '').toString();
-  const timeoutS  = Math.min(parseInt(body.timeoutSec || DEFAULT_TIMEOUT, 10) || DEFAULT_TIMEOUT, MAX_TIMEOUT);
+  const requestedTimeoutS = parseInt(body.timeoutSec || DEFAULT_TIMEOUT, 10) || DEFAULT_TIMEOUT;
+  if (requestedTimeoutS > MAX_TIMEOUT) {
+    return json(res, 400, { ok: false, error: 'bad_timeout', max: MAX_TIMEOUT });
+  }
+  const timeoutS  = requestedTimeoutS;
   if (!prompt) return json(res, 400, { ok: false, error: 'missing prompt' });
   const effectiveKey = apiKey || SERVER_LLM_API_KEY;
   if (!effectiveKey) return json(res, 400, { ok: false, error: 'missing apiKey: neither request body nor server has one' });
@@ -504,7 +508,7 @@ async function handleRun(req, res) {
     let payload, status;
     if (killed) {
       status = 504;
-      payload = { ok: false, error: `timed out after ${timeoutS}s`, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192) };
+      payload = { ok: false, exitCode: 124, error: 'timeout', runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192) };
     } else if (code === 0) {
       status = 200;
       payload = { ok: true, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192) };
@@ -542,7 +546,11 @@ async function handleRunAsync(req, res) {
   const prompt    = (body.prompt || '').toString();
   const apiKey    = (body.apiKey || body.openaiApiKey || process.env.DEFAULT_OPENAI_API_KEY || '').toString();
   const model     = (body.model  || process.env.DEFAULT_MODEL || '').toString();
-  const timeoutS  = Math.min(parseInt(body.timeoutSec || MAX_TIMEOUT, 10) || MAX_TIMEOUT, MAX_TIMEOUT);
+  const requestedTimeoutS = parseInt(body.timeoutSec || MAX_TIMEOUT, 10) || MAX_TIMEOUT;
+  if (requestedTimeoutS > MAX_TIMEOUT) {
+    return json(res, 400, { ok: false, error: 'bad_timeout', max: MAX_TIMEOUT });
+  }
+  const timeoutS  = requestedTimeoutS;
   if (!prompt) return json(res, 400, { ok: false, error: 'missing prompt' });
   const effectiveKey = apiKey || SERVER_LLM_API_KEY;
   if (!effectiveKey) return json(res, 400, { ok: false, error: 'missing apiKey: neither request body nor server has one' });
@@ -623,8 +631,9 @@ async function handleRunAsync(req, res) {
     if (job.killed) {
       job.state = 'error';
       job.ok = false;
-      job.error = 'timed out after ' + timeoutS + 's';
-      emitJob(job, 'done', { ok: false, exitCode: null, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, error: job.error, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192) });
+      job.error = 'timeout';
+      job.exitCode = 124;
+      emitJob(job, 'done', { ok: false, exitCode: 124, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, error: job.error, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192) });
     } else if (code === 0) {
       job.state = 'done';
       job.ok = true;
