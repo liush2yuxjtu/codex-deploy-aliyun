@@ -8,12 +8,15 @@ blocked_by: []
 soft_blocked_by: []
 files:
   - docs/README.md
+  - docs/adr/README.md
   - docs/adr/0001-no-docker.md
 risk: low
 effort: medium
 expected_commits: 2
 ready_for_agent: true
-status: pending
+status: done
+closed_at: 2026-06-12
+merged_commit: d77b181
 ---
 
 # ISSUE-009: docs/ 索引页 + ADR 框架
