@@ -78,6 +78,110 @@ async function recordRun(row) {
   }
 }
 
+// ─── codex_jobs persistence (ISSUE-010) ───
+// Best-effort INSERT after spawn + UPDATE on terminal state. Failures only
+// log; the in-memory JOBS Map remains the source of truth within the 60-min
+// TTL. stdout / stderr live as files under /var/lib/codex-runs/<runId>/ —
+// RDS stores only their paths.
+async function insertCodexJob(row) {
+  if (!pgPool) return;
+  try {
+    await pgPool.query(
+      `INSERT INTO codex_jobs
+         (job_id, status, prompt, model, started_at, finished_at,
+          duration_ms, exit_code, client_ip, last_event_ts,
+          stdout_path, stderr_path)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (job_id) DO NOTHING`,
+      [
+        row.jobId, row.status, row.prompt, row.model ?? null,
+        row.startedAt, row.finishedAt ?? null,
+        row.durationMs ?? null, row.exitCode ?? null,
+        row.clientIp ?? null, row.lastEventTs,
+        row.stdoutPath, row.stderrPath,
+      ]
+    );
+  } catch (e) {
+    console.error('[codexJobs] insert failed:', e.message);
+  }
+}
+
+async function updateCodexJobTerminal(row) {
+  if (!pgPool) return;
+  try {
+    await pgPool.query(
+      `UPDATE codex_jobs
+          SET status        = $2,
+              finished_at   = $3,
+              duration_ms   = $4,
+              exit_code     = $5,
+              last_event_ts = $6
+        WHERE job_id = $1`,
+      [
+        row.jobId, row.status,
+        row.finishedAt ?? null,
+        row.durationMs ?? null,
+        row.exitCode ?? null,
+        row.lastEventTs,
+      ]
+    );
+  } catch (e) {
+    console.error('[codexJobs] update failed:', e.message);
+  }
+}
+
+// Re-hydrate a read-only job snapshot from RDS for /job/:id on a memory miss.
+// Returns null if the row doesn't exist or the DB is unavailable. The returned
+// shape mirrors what handleJobStatus writes back (emitter=null, no event
+// replay — that path is SSE-only and stays memory-resident).
+async function loadJobFromRds(jobId) {
+  if (!pgPool) return null;
+  try {
+    const r = await pgPool.query(
+      `SELECT job_id, status, prompt, model, started_at, finished_at,
+              duration_ms, exit_code, client_ip, last_event_ts,
+              stdout_path, stderr_path
+         FROM codex_jobs
+        WHERE job_id = $1`,
+      [jobId]
+    );
+    if (!r.rows.length) return null;
+    const row = r.rows[0];
+    const stateMap = {
+      queued: 'pending', running: 'running', firstByte: 'running',
+      done: 'done', error: 'error', cancelled: 'error', timeout: 'error',
+    };
+    const s = row.status;
+    return {
+      id: row.job_id,
+      state: stateMap[s] || 'error',
+      prompt: row.prompt,
+      model: row.model,
+      started: parseInt(row.started_at, 10),
+      finished: row.finished_at != null ? parseInt(row.finished_at, 10) : null,
+      durationMs: row.duration_ms != null ? parseInt(row.duration_ms, 10) : null,
+      exitCode: row.exit_code,
+      clientIp: row.client_ip,
+      runId: null,
+      spawnMs: null, gatewayMs: null,
+      ok: s === 'done',
+      error: (s === 'error' || s === 'timeout' || s === 'cancelled')
+        ? ('job finished with status=' + s) : null,
+      quotaExceeded: false,
+      stdout: '', stderr: '',
+      stdoutPath: row.stdout_path,
+      stderrPath: row.stderr_path,
+      lastEvent: { type: s, ts: parseInt(row.last_event_ts, 10) },
+      emitter: null,
+      subscribers: 0,
+      fromRds: true,
+    };
+  } catch (e) {
+    console.error('[codexJobs] load failed:', e.message);
+    return null;
+  }
+}
+
 const CODEX_BIN     = '/opt/node-v20.18.1-linux-x64/bin/codex';
 const SANDBOX_USER  = 'codexsbx';
 const RUN_BASE      = '/var/lib/codex-runs';
@@ -583,6 +687,22 @@ async function handleRunAsync(req, res) {
   emitJob(job, 'start', { runId: spawn.runId, startedAt: spawn.started });
   emitJob(job, 'running', {});
 
+  // Best-effort: persist the row to codex_jobs so /job/:id survives a restart.
+  // stdout/stderr stay in the per-run workDir; RDS only stores their paths.
+  // The pre-filled paths mean a row exists even if the process dies before
+  // the close handler runs (so the ISSUE-010 memory-miss path can rebuild it).
+  Promise.resolve().then(() => insertCodexJob({
+    jobId: job.id,
+    status: 'running',
+    prompt: job.prompt,
+    model: job.model,
+    startedAt: job.started,
+    lastEventTs: Date.now(),
+    stdoutPath: path.join(spawn.workDir, 'stdout.log'),
+    stderrPath: path.join(spawn.workDir, 'stderr.log'),
+    clientIp,
+  })).catch(e => console.error('[codexJobs insert outer]', e.message));
+
   // respond 202 with the handles BEFORE we wait for the child
   json(res, 202, {
     ok: true, async: true, jobId: job.id, runId: spawn.runId,
@@ -645,6 +765,21 @@ async function handleRunAsync(req, res) {
       emitJob(job, 'done', { ok: false, exitCode: code, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192) });
     }
 
+    // Terminal state → UPDATE codex_jobs (best-effort, log only on failure).
+    // The 'timeout' / 'cancelled' enum values are reserved for the kill flow
+    // (ISSUE-002/004/013). Here we map job.state ('done' | 'error') to the
+    // RDS codex_jobs.status enum; the timeout case uses 'timeout' so the
+    // /job/:id reload path can surface it correctly.
+    const terminalStatus = job.killed ? 'timeout' : job.state;
+    Promise.resolve().then(() => updateCodexJobTerminal({
+      jobId: job.id,
+      status: terminalStatus,
+      finishedAt: job.finished,
+      durationMs: job.durationMs,
+      exitCode: job.exitCode,
+      lastEventTs: Date.now(),
+    })).catch(e => console.error('[codexJobs update outer]', e.message));
+
     // fire-and-forget persistence (same shape as handleRun)
     Promise.resolve().then(() => recordRun({
       runId: spawn.runId, prompt, model: effectiveModel || null,
@@ -663,21 +798,55 @@ async function handleRunAsync(req, res) {
     job.finished = Date.now();
     try { fs.rmSync(spawn.workDir, { recursive: true, force: true }); } catch {}
     emitJob(job, 'error', { error: job.error });
+    // Best-effort: also update the codex_jobs row (status=error).
+    Promise.resolve().then(() => updateCodexJobTerminal({
+      jobId: job.id,
+      status: 'error',
+      finishedAt: job.finished,
+      durationMs: job.durationMs ?? null,
+      exitCode: job.exitCode ?? null,
+      lastEventTs: Date.now(),
+    })).catch(e => console.error('[codexJobs update outer]', e.message));
   });
 }
 
-function handleJobStatus(req, res, jobId) {
+async function handleJobStatus(req, res, jobId) {
   const job = JOBS.get(jobId);
-  if (!job) return json(res, 404, { ok: false, error: 'job not found or expired' });
-  json(res, 200, {
-    ok: true, jobId: job.id, state: job.state, runId: job.runId,
-    prompt: job.prompt, model: job.model, started: job.started, finished: job.finished,
-    durationMs: job.durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs,
-    quotaExceeded: job.quotaExceeded, exitCode: job.exitCode, ok: job.ok, error: job.error,
-    stdoutPreview: (job.stdout || '').slice(-4000),
-    stderrPreview: (job.stderr || '').slice(-2000),
-    subscribers: job.subscribers,
-    lastEvent: job.lastEvent || null,
+  if (job) {
+    return json(res, 200, {
+      ok: true, jobId: job.id, state: job.state, runId: job.runId,
+      prompt: job.prompt, model: job.model, started: job.started, finished: job.finished,
+      durationMs: job.durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs,
+      quotaExceeded: job.quotaExceeded, exitCode: job.exitCode, ok: job.ok, error: job.error,
+      stdoutPreview: (job.stdout || '').slice(-4000),
+      stderrPreview: (job.stderr || '').slice(-2000),
+      subscribers: job.subscribers,
+      lastEvent: job.lastEvent || null,
+    });
+  }
+  // Memory miss → fall through to RDS (ISSUE-010). This is what makes
+  // /job/:id survive a process restart / 60-min Map GC.
+  const rdsJob = await loadJobFromRds(jobId);
+  if (!rdsJob) return json(res, 404, { ok: false, error: 'job not found or expired' });
+  let stdoutTail = '', stderrTail = '';
+  try {
+    if (rdsJob.stdoutPath && fs.existsSync(rdsJob.stdoutPath)) stdoutTail = fs.readFileSync(rdsJob.stdoutPath, 'utf8').slice(-4000);
+  } catch {}
+  try {
+    if (rdsJob.stderrPath && fs.existsSync(rdsJob.stderrPath)) stderrTail = fs.readFileSync(rdsJob.stderrPath, 'utf8').slice(-2000);
+  } catch {}
+  return json(res, 200, {
+    ok: true, fromRds: true,
+    jobId: rdsJob.id, state: rdsJob.state, runId: rdsJob.runId,
+    prompt: rdsJob.prompt, model: rdsJob.model, started: rdsJob.started, finished: rdsJob.finished,
+    durationMs: rdsJob.durationMs, spawnMs: rdsJob.spawnMs, gatewayMs: rdsJob.gatewayMs,
+    quotaExceeded: rdsJob.quotaExceeded, exitCode: rdsJob.exitCode, ok: rdsJob.ok, error: rdsJob.error,
+    stdoutPreview: stdoutTail,
+    stderrPreview: stderrTail,
+    subscribers: 0,
+    lastEvent: rdsJob.lastEvent,
+    stdoutPath: rdsJob.stdoutPath,
+    stderrPath: rdsJob.stderrPath,
   });
 }
 
@@ -775,7 +944,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && jobMatch) {
     const jobId = jobMatch[1];
     if (url.pathname.endsWith('/events')) return handleJobEvents(req, res, jobId);
-    return handleJobStatus(req, res, jobId);
+    return await handleJobStatus(req, res, jobId);
   }
   // ─── /pdf: URL or local path → PDF via md-to-pdf-webfirst skill ───
   if (req.method === 'POST' && (url.pathname === '/pdf' || url.pathname === '/pdf/from-url')) {
