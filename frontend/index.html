@@ -641,6 +641,16 @@ function appendTurn(t) {
       if (t.error) {
         bubble.innerHTML += `<div style="color:var(--danger);font-weight:500;">⚠ ${escapeHtml(t.error)}</div>`;
       }
+      // ISSUE-012: collapsible "看 raw output" tail panel for async jobs.
+      // Default collapsed; toggles via the toggle button. Re-render is cheap
+      // because the panel only owns its own <pre> + overflow note.
+      if (t.async && t.jobId) {
+        const tail = renderTailPanel(t);
+        if (tail) {
+          t.tailPanelEl = tail.el;
+          bubble.appendChild(tail.el);
+        }
+      }
       // short summary above raw output for failed runs
       if (t.isHistory && !t.ok) {
         const summary = document.createElement('div');
@@ -711,6 +721,111 @@ function appendTurn(t) {
 
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function scrollToBottom() { const s = document.getElementById('scroll'); s.scrollTop = s.scrollHeight; }
+
+// ISSUE-012: collapsible tail-view panel. Renders a 200-line window of
+// assistantTurn.tailLines.{stdout,stderr}. Re-rendering the entire card on
+// every SSE batch is wasteful; we keep a reference to the panel DOM and
+// re-render only this <div> in place via refreshTailPanel().
+const TAIL_VISIBLE_MAX = 200;
+
+function ensureTailBuckets(turn) {
+  if (!turn.tailLines) turn.tailLines = { stdout: [], stderr: [] };
+  if (typeof turn.tailOpen !== 'boolean') turn.tailOpen = false;
+  return turn.tailLines;
+}
+
+function refreshTailPanel(turn) {
+  // appendTurn() may re-create the panel DOM (e.g. when the live timer
+  // updates re-render the card). Re-attach the reference if our old node
+  // is no longer in the document.
+  if (!turn.tailPanelEl || !turn.tailPanelEl.isConnected) {
+    const turnDiv = document.querySelector('.turn.assistant:last-of-type .tail-panel');
+    turn.tailPanelEl = turnDiv || null;
+  }
+  if (!turn.tailPanelEl) return;
+  const body = turn.tailPanelEl.querySelector('.tail-body');
+  const overflow = turn.tailPanelEl.querySelector('.tail-overflow');
+  if (!body) return;
+  const lines = ensureTailBuckets(turn);
+  const total = lines.stdout.length + lines.stderr.length;
+  const show = turn.tailOpen;
+  // Always render the open state to keep DOM in sync with newest line.
+  // When collapsed, body has display:none (set in renderTailPanel).
+  body.style.display = show ? '' : 'none';
+  // Build a windowed view: if total > TAIL_VISIBLE_MAX we show the *last*
+  // TAIL_VISIBLE_MAX lines, with a leading "… 还有 N 行" overflow note.
+  const merged = [];
+  for (const l of lines.stdout) merged.push({ kind: 'stdout', text: l });
+  for (const l of lines.stderr) merged.push({ kind: 'stderr', text: l });
+  const skip = Math.max(0, merged.length - TAIL_VISIBLE_MAX);
+  const slice = merged.slice(skip);
+  // Render each line as its own <div> so escapeHtml cannot be bypassed and
+  // long lines wrap nicely.
+  body.innerHTML = slice.map(l =>
+    '<div class="tail-line tail-' + l.kind + '">' + escapeHtml(l.text) + '</div>'
+  ).join('');
+  if (overflow) overflow.style.display = '';
+  overflow.innerHTML = '';
+  if (skip > 0) {
+    const histUrl = turn.runId
+      ? cfg.endpoint + '/history/' + encodeURIComponent(turn.runId)
+      : (cfg.endpoint + '/job/' + encodeURIComponent(turn.jobId));
+    const link = document.createElement('a');
+    link.href = '#';
+    link.textContent = '…还有 ' + skip + ' 行,点此查看完整 (' + (turn.runId ? '/history/' + turn.runId.slice(0, 8) : '/job/' + turn.jobId.slice(0, 8)) + ')';
+    link.style.cssText = 'color:var(--text-dim);font-size:12px;text-decoration:underline;cursor:pointer;';
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      window.open(histUrl, '_blank', 'noopener');
+    });
+    overflow.appendChild(link);
+  } else {
+    overflow.textContent = total ? ('共 ' + total + ' 行') : '';
+    overflow.style.color = 'var(--text-faint)';
+  }
+}
+
+function renderTailPanel(turn) {
+  ensureTailBuckets(turn);
+  const wrap = document.createElement('div');
+  wrap.className = 'tail-panel';
+  wrap.style.cssText = 'margin-top:10px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,0.02);overflow:hidden;';
+
+  const head = document.createElement('div');
+  head.className = 'tail-head';
+  head.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;user-select:none;font-size:12px;color:var(--text-dim);';
+  const chev = document.createElement('span');
+  chev.className = 'tail-chev';
+  chev.textContent = turn.tailOpen ? '▾' : '▸';
+  chev.style.cssText = 'display:inline-block;width:14px;color:var(--text-faint);';
+  const title = document.createElement('span');
+  title.className = 'tail-title';
+  title.textContent = '看 raw output';
+  const count = document.createElement('span');
+  count.className = 'tail-count';
+  count.style.cssText = 'color:var(--text-faint);font-size:11px;';
+  head.appendChild(chev); head.appendChild(title); head.appendChild(count);
+
+  const body = document.createElement('div');
+  body.className = 'tail-body';
+  body.style.cssText = 'display:none;max-height:240px;overflow-y:auto;background:#0d0d0d;font-family:\'JetBrains Mono\',monospace;font-size:12px;line-height:1.5;padding:6px 10px;';
+
+  const overflow = document.createElement('div');
+  overflow.className = 'tail-overflow';
+  overflow.style.cssText = 'padding:6px 12px;font-size:12px;border-top:1px solid var(--border);background:rgba(255,255,255,0.02);';
+
+  wrap.appendChild(head);
+  wrap.appendChild(body);
+  wrap.appendChild(overflow);
+
+  head.addEventListener('click', () => {
+    turn.tailOpen = !turn.tailOpen;
+    chev.textContent = turn.tailOpen ? '▾' : '▸';
+    refreshTailPanel(turn);
+  });
+  refreshTailPanel(turn);
+  return { el: wrap };
+}
 
 function renderPdfCard(pdf) {
   const card = document.createElement('div');

@@ -650,6 +650,8 @@ async function handleRunAsync(req, res) {
   const prompt    = (body.prompt || '').toString();
   const apiKey    = (body.apiKey || body.openaiApiKey || process.env.DEFAULT_OPENAI_API_KEY || '').toString();
   const model     = (body.model  || process.env.DEFAULT_MODEL || '').toString();
+  // ISSUE-014: optional sessionId to continue a previous conversation.
+  const sessionId = (body.sessionId || '').toString().trim() || null;
   const requestedTimeoutS = parseInt(body.timeoutSec || MAX_TIMEOUT, 10) || MAX_TIMEOUT;
   if (requestedTimeoutS > MAX_TIMEOUT) {
     return json(res, 400, { ok: false, error: 'bad_timeout', max: MAX_TIMEOUT });
@@ -674,7 +676,7 @@ async function handleRunAsync(req, res) {
 
   let spawn;
   try {
-    spawn = startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientIp });
+    spawn = startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientIp, sessionId });
   } catch (e) {
     job.state = 'error';
     job.error = String(e && e.message || e);
@@ -718,6 +720,54 @@ async function handleRunAsync(req, res) {
   }, timeoutS * 1000);
   killTimer.unref();
 
+  // ISSUE-012: per-line, debounced tail stream. We split each chunk on \n,
+  // keep the trailing partial in a buffer, and emit a batch of {lines: [...]}
+  // at most every 100ms so the SSE channel doesn't get flooded. The
+  // synchronous /run path is untouched and never emits these events.
+  function makeLineTail(eventType) {
+    let buf = '';
+    let pending = [];
+    let scheduled = null;
+    const flush = () => {
+      scheduled = null;
+      if (!pending.length) return;
+      const lines = pending;
+      pending = [];
+      emitJob(job, eventType, { lines });
+    };
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = setTimeout(flush, 100);
+    };
+    return {
+      push(chunkStr) {
+        buf += chunkStr;
+        let idx;
+        const out = [];
+        while ((idx = buf.indexOf('\n')) !== -1) {
+          out.push(buf.slice(0, idx).replace(/\r$/, ''));
+          buf = buf.slice(idx + 1);
+        }
+        if (out.length) {
+          pending = pending.concat(out);
+          schedule();
+        }
+      },
+      // Force a final flush — used on child close so the trailing partial
+      // line (no trailing newline) still reaches the UI.
+      end() {
+        if (buf.length) {
+          pending = pending.concat([buf]);
+          buf = '';
+        }
+        if (scheduled) { clearTimeout(scheduled); scheduled = null; }
+        flush();
+      },
+    };
+  }
+  const stdoutTail = makeLineTail('codexStdout:line');
+  const stderrTail = makeLineTail('codexStderr:line');
+
   let firstByteMs = null;
   spawn.child.stdout.on('data', c => {
     if (firstByteMs === null) {
@@ -725,8 +775,10 @@ async function handleRunAsync(req, res) {
       job.spawnMs = firstByteMs;
       emitJob(job, 'firstByte', { spawnMs: firstByteMs });
     }
-    job.stdout += c.toString('utf8');
+    const s = c.toString('utf8');
+    job.stdout += s;
     job.stdoutBytes = job.stdout.length;
+    stdoutTail.push(s);
   });
   spawn.child.stderr.on('data', c => {
     if (firstByteMs === null) {
@@ -734,18 +786,32 @@ async function handleRunAsync(req, res) {
       job.spawnMs = firstByteMs;
       emitJob(job, 'firstByte', { spawnMs: firstByteMs });
     }
-    job.stderr += c.toString('utf8');
+    const s = c.toString('utf8');
+    job.stderr += s;
     job.stderrBytes = job.stderr.length;
+    stderrTail.push(s);
   });
 
   spawn.child.on('close', (code) => {
     clearTimeout(killTimer);
+    // ISSUE-012: drain any buffered tail lines so the UI sees the final
+    // partial line of stdout / stderr.
+    try { stdoutTail.end(); } catch {}
+    try { stderrTail.end(); } catch {}
     const durationMs = Date.now() - spawn.started;
     job.finished = Date.now();
     job.durationMs = durationMs;
     job.gatewayMs = firstByteMs != null ? Math.max(0, durationMs - firstByteMs) : 0;
     job.quotaExceeded = /\b(429|too many requests|rate[_ -]?limit)\b/i.test(job.stderr + job.stdout);
     job.exitCode = code;
+    // ISSUE-014: parse the codex thread id out of NDJSON stdout and
+    // decide whether the resume actually succeeded. For a successful
+    // resume of session X, codex re-emits thread.started with the same
+    // id; for a failed resume (session not found / GC'd), we either get
+    // no event or a different one.
+    const codexSessionId = parseCodexSessionId(job.stdout);
+    const requestedSessionId = spawn.sessionId || null;
+    const resumedOk = !!requestedSessionId && code === 0 && !!codexSessionId;
     try { fs.rmSync(spawn.workDir, { recursive: true, force: true }); } catch {}
 
     if (job.killed) {
@@ -764,6 +830,16 @@ async function handleRunAsync(req, res) {
       job.error = 'codex exit ' + code;
       emitJob(job, 'done', { ok: false, exitCode: code, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192) });
     }
+
+    // ISSUE-014: surface resume outcome to the client via a dedicated SSE
+    // event so the UI can show "continued / fallback / fresh" without
+    // waiting for the next /job/:id poll.
+    emitJob(job, 'codexSession', {
+      codexSessionId: codexSessionId || null,
+      parentSessionId: requestedSessionId,
+      resumed: resumedOk,
+      ...(requestedSessionId && !resumedOk ? { fallbackReason: 'session_not_found' } : {}),
+    });
 
     // Terminal state → UPDATE codex_jobs (best-effort, log only on failure).
     // The 'timeout' / 'cancelled' enum values are reserved for the kill flow
