@@ -12,7 +12,7 @@ risk: low
 effort: small
 expected_commits: 1
 ready_for_agent: true
-status: pending
+status: done
 ---
 
 # ISSUE-005: killJobTree helper(SIGTERM→SIGKILL)
