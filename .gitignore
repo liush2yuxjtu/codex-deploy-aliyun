@@ -21,6 +21,7 @@ Thumbs.db
 
 # Worktrees / test artifacts
 .playwright-mcp/
+workspace/fixtures/anonymized.html
 workspace/pdf-*.png
 workspace/pdf-ui*.png
 workspace/work/          # md-to-pdf-webfirst scratch workdirs (chrome-profile, etc.)
