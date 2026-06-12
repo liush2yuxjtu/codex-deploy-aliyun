@@ -106,8 +106,15 @@ if [[ "$SERVER_ONLY" -eq 0 ]]; then
   ts="$(date -u +%Y%m%d-%H%M%S)"
   log "backup existing server.js → server.js.bak.$ts"
   run "$SSH \"cp '$SERVER_DIR/server.js' '$SERVER_DIR/server.js.bak.$ts'\""
-  log "drop local server.js → $SERVER_DIR/server.js"
-  run "$SCP $REPO_DIR/server/server.js $SSH_TARGET:$SERVER_DIR/server.js"
+  log "drop local server/*.js → $SERVER_DIR/"
+  # Ship every server/*.js file alongside server.js. server.js does
+  # `require('./sls-logger')` and friends; if we only send server.js
+  # the next systemctl restart fails with MODULE_NOT_FOUND and the
+  # service enters a crash loop.
+  for f in "$REPO_DIR"/server/*.js; do
+    [[ -f "$f" ]] || continue
+    run "$SCP '$f' $SSH_TARGET:$SERVER_DIR/$(basename "$f")"
+  done
 fi
 
 if [[ "$MIGRATIONS_ONLY" -eq 0 ]]; then
