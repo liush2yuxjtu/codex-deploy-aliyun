@@ -666,17 +666,69 @@ function appendTurn(t) {
         summary.innerHTML = msg;
         bubble.appendChild(summary);
       }
+      // Chat UX: when the server extracted a finalAnswer, render IT as the
+      // main bubble content (markdown preserved as plain text; newlines
+      // honored via pre-wrap). The raw transcript — banner, codex CLI
+      // config, user-prompt echo, model reasoning, all web-search tool
+      // calls, sandbox stats — goes into a collapsed <details> panel so
+      // users can audit when needed but the chat stays readable.
+      //
+      // Falls back to the old "raw transcript as main content" rendering
+      // when finalAnswer is missing (history rows written before this
+      // change, error transcripts without a recognisable "codex" turn, or
+      // a future server that doesn't set the field).
+      if (t.finalAnswer) {
+        const finalEl = document.createElement('div');
+        finalEl.className = 'final-answer';
+        finalEl.style.cssText = 'white-space: pre-wrap; line-height: 1.6; font-size: 14px; color: var(--text); margin-top: 2px;';
+        finalEl.textContent = t.finalAnswer;
+        bubble.appendChild(finalEl);
+      }
       if (t.stdout) {
-        const pre = document.createElement('pre');
-        pre.className = 'code';
-        pre.textContent = t.stdout;
-        bubble.appendChild(pre);
+        if (t.finalAnswer) {
+          const details = document.createElement('details');
+          details.className = 'codex-raw';
+          details.style.cssText = 'margin-top: 10px; font-size: 12px; color: var(--text-dim);';
+          const summary = document.createElement('summary');
+          summary.style.cssText = 'cursor: pointer; user-select: none; padding: 4px 0;';
+          summary.textContent = '查看 Codex 原始输出 (' + t.stdout.length + ' 字符)';
+          details.appendChild(summary);
+          const pre = document.createElement('pre');
+          pre.className = 'code';
+          pre.style.cssText = 'margin-top: 6px; max-height: 360px; overflow: auto;';
+          pre.textContent = t.stdout;
+          details.appendChild(pre);
+          bubble.appendChild(details);
+        } else {
+          // No finalAnswer — render the raw transcript as the main content
+          // so history rows / error transcripts still carry the signal.
+          const pre = document.createElement('pre');
+          pre.className = 'code';
+          pre.textContent = t.stdout;
+          bubble.appendChild(pre);
+        }
       }
       if (t.stderr) {
-        const pre = document.createElement('pre');
-        pre.className = 'code stderr';
-        pre.textContent = t.stderr;
-        bubble.appendChild(pre);
+        if (t.finalAnswer) {
+          const details = document.createElement('details');
+          details.className = 'codex-raw-stderr';
+          details.style.cssText = 'margin-top: 6px; font-size: 12px; color: var(--text-dim);';
+          const summary = document.createElement('summary');
+          summary.style.cssText = 'cursor: pointer; user-select: none; padding: 4px 0;';
+          summary.textContent = '查看 Codex stderr (' + t.stderr.length + ' 字符)';
+          details.appendChild(summary);
+          const pre = document.createElement('pre');
+          pre.className = 'code stderr';
+          pre.style.cssText = 'margin-top: 6px; max-height: 240px; overflow: auto;';
+          pre.textContent = t.stderr;
+          details.appendChild(pre);
+          bubble.appendChild(details);
+        } else {
+          const pre = document.createElement('pre');
+          pre.className = 'code stderr';
+          pre.textContent = t.stderr;
+          bubble.appendChild(pre);
+        }
       }
       const meta = document.createElement('div');
       meta.className = 'turn-meta';
