@@ -122,3 +122,15 @@ graph TD
 - ISSUE-003 timeoutSec 前端下拉(5399f7c) — 2026-06-12 — agent: codex
 - ISSUE-012 异步任务 chat tail 日志流(e04f0fa) — 2026-06-12 — agent: codex
 - ISSUE-013 并发信号量 + FIFO 队列(e3b3eb2) — 2026-06-12 — agent: codex
+
+## v3 增量(2026-06-12 fork 拍板,从 aliyun-start 5 个候选挑出)
+
+| ID | Title | Group | Status | Commit |
+|---|---|---|---|---|
+| [021](021-rds-migrate.md) | rds-migrate.sh idempotent migration applier | v3A | ✅ done | `6d932d1` |
+| [022](022-oss-pdf-bucket.md) | OSS PDF bucket + presigned URL 落点 | v3B | ⏳ spec | — |
+| [023](023-network-reachability.md) | SWAS-cs → RDS-cb 网络可达性诊断 | v3B | ⏳ spec | — |
+| [024](024-sls-logging.md) | codex-api 日志 → SLS,告别 journalctl | v3B | ⏳ spec | — |
+| [025](025-ecs-code-deploy.md) | ecs-code-deploy.sh idempotent atomic deploy | v3A | ✅ done | `ae4401b` |
+
+v3 候选出处:`/aliyun-start` deep research,见 `/tmp/...` 报告或 handoff v2 doc 末尾。
