@@ -1,0 +1,11 @@
+{
+  "name": "office-agents",
+  "version": "0.1.0",
+  "description": "Take a /to-issues output directory (default `.agent/issues/`) and spawn non-blocking subagents in an event-driven, ready-edge-triggered loop — the moment a slice's REAL upstream dependencies all land, fire its worker immediately, instead of waiting for wave barriers like /afk-agents. Use when the user is at the desk and wants tightest wall-clock convergence on a pre-broken-down issue set. Chains after /to-issues in the /to-prd → /to-issues → /office-agents pipeline (sibling to /afk-agents). Pure orchestration — no shell scripts, no helper binaries. The skill reads frontmatter, generates ALL mocks up-front, dispatches the Agent tool per ready-edge, and writes a per-edge dispatch log + a final report.",
+  "author": {
+    "name": "afk-agents-plugins"
+  },
+  "skills": [
+    "office-agents"
+  ]
+}
