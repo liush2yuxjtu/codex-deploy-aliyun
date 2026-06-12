@@ -13,7 +13,9 @@ risk: low
 effort: small
 expected_commits: 2
 ready_for_agent: true
-status: pending
+status: done
+closed_at: 2026-06-12
+merged_commit: 6350eea
 ---
 
 # ISSUE-023: SWAS-cs → RDS-cb 网络可达性诊断
