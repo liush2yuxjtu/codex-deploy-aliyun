@@ -13,9 +13,30 @@ const { randomUUID } = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+// ISSUE-024: ship operationally meaningful log lines to Aliyun SLS
+// (replaces `journalctl -u codex-api.service -f`). stdout stays the
+// primary sink; sls is a best-effort secondary.
+const sls = require('./sls-logger');
 
 const PORT          = parseInt(process.env.PORT || '3030', 10);
 const SHARED_SECRET = process.env.DEMO_SECRET || ''; // empty = no auth
+
+// Dual-write helper: echo to stdout (so journalctl still works) AND
+// ship a structured copy to SLS. NEVER awaits on SLS — that is the
+// logToSls contract. Use this for operationally meaningful lines
+// (request entry, job start/done/error, persistence failures, etc.).
+// For boot-time banners and one-off debug, call console.log directly.
+function slog(level, message, fields) {
+  const tail = fields ? ' ' + Object.entries(fields)
+    .filter(([k]) => k !== 'level' && k !== 'message')
+    .map(([k, v]) => k + '=' + (typeof v === 'object' ? JSON.stringify(v) : v))
+    .join(' ') : '';
+  const line = '[' + (level || 'info') + '] ' + message + tail;
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+  else console.log(line);
+  sls.logToSls(level, message, fields);
+}
 const SECRET_FILE = '/etc/codex-api/secret.env';
 let RDS_HOST='', RDS_PORT=5432, RDS_DB='', RDS_USER='', RDS_PASSWORD='';
 let SERVER_LLM_API_KEY = '';
@@ -49,10 +70,10 @@ if (RDS_HOST && RDS_DB && RDS_USER) {
       ssl: false,
       max: 4, idleTimeoutMillis: 30000, connectionTimeoutMillis: 8000,
     });
-    pgPool.on('error', (e) => console.error('[pg pool error]', e.message));
+    pgPool.on('error', (e) => slog('error', '[pg pool error] ' + e.message, { source: 'pg-pool' }));
     console.log('[codex-api] pg pool initialised → ' + RDS_USER + '@' + RDS_HOST + '/' + RDS_DB);
   } catch (e) {
-    console.error('[codex-api] pg init failed:', e.message);
+    slog('error', '[codex-api] pg init failed: ' + e.message, { source: 'pg-init' });
     pgPool = null;
   }
 } else {
@@ -82,7 +103,7 @@ async function recordRun(row) {
        row.parentSessionId ?? null]
     );
   } catch (e) {
-    console.error('[recordRun] insert failed:', e.message);
+    slog('error', '[recordRun] insert failed: ' + e.message, { source: 'recordRun' });
   }
 }
 
@@ -110,7 +131,7 @@ async function insertCodexJob(row) {
       ]
     );
   } catch (e) {
-    console.error('[codexJobs] insert failed:', e.message);
+    slog('error', '[codexJobs] insert failed: ' + e.message, { source: 'codexJobs-insert' });
   }
 }
 
@@ -134,7 +155,7 @@ async function updateCodexJobTerminal(row) {
       ]
     );
   } catch (e) {
-    console.error('[codexJobs] update failed:', e.message);
+    slog('error', '[codexJobs] update failed: ' + e.message, { source: 'codexJobs-update' });
   }
 }
 
@@ -160,7 +181,7 @@ async function updateCodexJobStatus(row) {
       ]
     );
   } catch (e) {
-    console.error('[codexJobs] status update failed:', e.message);
+    slog('error', '[codexJobs] status update failed: ' + e.message, { source: 'codexJobs-status' });
   }
 }
 
@@ -211,7 +232,7 @@ async function loadJobFromRds(jobId) {
       fromRds: true,
     };
   } catch (e) {
-    console.error('[codexJobs] load failed:', e.message);
+    slog('error', '[codexJobs] load failed: ' + e.message, { source: 'codexJobs-load' });
     return null;
   }
 }
@@ -389,7 +410,7 @@ async function killJobTree(child, { gracefulMs = 5000, jobId = '-', reason = 'us
     return { killed: false, reason: 'no_child' };
   }
   const pid = child.pid;
-  const log = (sig, why) => console.log(`[killJobTree] job=${jobId} pid=${pid} sig=${sig} reason=${why}`);
+  const log = (sig, why) => slog('info', '[killJobTree] ' + sig + ' ' + why, { jobId, pid, sig });
 
   // Helper: signal the process group; fall back to direct kill if the group
   // is gone. Bubbles ESRCH so the caller can map to "already_dead".
@@ -588,7 +609,7 @@ function parseMultipart(req, boundary) {
 // Map skill/IO errors to one-line client-safe messages. Full stderr stays in journalctl.
 function sanitizePdfError(err, kind) {
   const msg = String(err && err.message || err || '');
-  console.error('[pdf:' + kind + ']', msg);  // full detail server-side
+  slog('warn', '[pdf:' + kind + '] ' + msg, { source: 'pdf', kind });  // full detail server-side + SLS
   if (/SSL_ERROR_SYSCALL|SSL_connect|certificate|ECONN|ENOTFOUND|getaddrinfo/i.test(msg)) {
     return '源 URL 网络失败(ssl/dns/连接)。请检查 URL 是否可访问。';
   }
@@ -818,6 +839,13 @@ async function handleRun(req, res) {
     }
     json(res, status, payload);
 
+    // ISSUE-024: ship a terminal "job done" line for the sync /run path.
+    slog(payload.ok ? 'info' : 'warn', 'job done sync ' + (payload.ok ? 'done' : (killed ? 'timeout' : 'error')), {
+      runId, route: '/run', statusCode: status,
+      durationMs, ok: !!payload.ok, quotaExceeded: !!quotaExceeded,
+      exitCode: payload.exitCode,
+    });
+
     // fire-and-forget persistence
     Promise.resolve().then(() => recordRun({
       runId, prompt, model: effectiveModel || null,
@@ -827,7 +855,7 @@ async function handleRun(req, res) {
       clientIp,
       codexSessionId: codexSessionId || null,
       parentSessionId: requestedSessionId,
-    })).catch(e => console.error('[recordRun outer]', e.message));
+    })).catch(e => slog('error', '[recordRun outer] ' + e.message, { runId, source: 'recordRun-outer' }));
   });
 
   child.on('error', (e) => {
@@ -895,7 +923,7 @@ async function handleRunAsync(req, res) {
     stdoutPath: placeholderStdout,
     stderrPath: placeholderStderr,
     clientIp,
-  })).catch(e => console.error('[codexJobs insert outer]', e.message));
+  })).catch(e => slog('error', '[codexJobs insert outer] ' + e.message, { jobId: job.id, source: 'codexJobs-insert-outer' }));
 
   if (startedQueued) {
     const pos = queue.length + 1;
@@ -925,7 +953,7 @@ async function handleRunAsync(req, res) {
         durationMs: null,
         exitCode: null,
         lastEventTs: Date.now(),
-      })).catch(err => console.error('[codexJobs update outer]', err.message));
+      })).catch(err => slog('warn', '[codexJobs update outer] ' + err.message, { jobId: job.id, source: 'codexJobs-update-outer' }));
       return;
     }
     void grant;
@@ -955,7 +983,7 @@ async function handleRunAsync(req, res) {
     lastEventTs: Date.now(),
     stdoutPath: path.join(spawn.workDir, 'stdout.log'),
     stderrPath: path.join(spawn.workDir, 'stderr.log'),
-  })).catch(e => console.error('[codexJobs status update outer]', e.message));
+  })).catch(e => slog('warn', '[codexJobs status update outer] ' + e.message, { jobId: job.id, source: 'codexJobs-status-outer' }));
 
   // respond 202 with the handles BEFORE we wait for the child
   json(res, 202, {
@@ -1145,7 +1173,7 @@ async function handleRunAsync(req, res) {
       durationMs: job.durationMs,
       exitCode: job.exitCode,
       lastEventTs: Date.now(),
-    })).catch(e => console.error('[codexJobs update outer]', e.message));
+    })).catch(e => slog('warn', '[codexJobs update outer] ' + e.message, { jobId: job.id, source: 'codexJobs-update-outer' }));
 
     // fire-and-forget persistence (same shape as handleRun)
     Promise.resolve().then(() => recordRun({
@@ -1156,7 +1184,15 @@ async function handleRunAsync(req, res) {
       clientIp,
       codexSessionId: codexSessionId || null,
       parentSessionId: requestedSessionId,
-    })).catch(e => console.error('[recordRun async]', e.message));
+    })).catch(e => slog('error', '[recordRun async] ' + e.message, { jobId: job.id, runId: spawn.runId, source: 'recordRun-async' }));
+    // ISSUE-024: ship a terminal "job done" line so the SLS dashboard
+    // can show P50/P95 durationMs + quotaExceeded rate.
+    slog(job.ok ? 'info' : 'warn', 'job done async ' + job.state, {
+      jobId: job.id, runId: spawn.runId, route: '/run-async',
+      durationMs: job.durationMs ?? null,
+      statusCode: job.ok ? 200 : (job.killed ? 504 : 502),
+      ok: !!job.ok, quotaExceeded: !!job.quotaExceeded,
+    });
     // ISSUE-013: free the concurrency slot; this drains the queue and grants
     // the next FIFO waiter their slot (activeCount--, then drainQueue()).
     releaseSlot();
@@ -1178,7 +1214,13 @@ async function handleRunAsync(req, res) {
       durationMs: job.durationMs ?? null,
       exitCode: job.exitCode ?? null,
       lastEventTs: Date.now(),
-    })).catch(e => console.error('[codexJobs update outer]', e.message));
+    })).catch(e => slog('warn', '[codexJobs update outer] ' + e.message, { jobId: job.id, source: 'codexJobs-update-outer' }));
+    // ISSUE-024: ship a terminal "job error" line so quota exceeded /
+    // spawn failures surface in the SLS dashboard.
+    slog('error', 'job error async: ' + (job.error || 'unknown'), {
+      jobId: job.id, runId: spawn.runId, route: '/run-async',
+      ok: false, error: job.error || 'spawn_error',
+    });
     // ISSUE-013: free the concurrency slot.
     releaseSlot();
   });
@@ -1269,8 +1311,8 @@ async function handleJobCancel(req, res, jobId) {
   // Don't await — killJobTree is fire-and-forget here; the actual
   // state transition happens when the child's `close` event fires.
   killJobTree(child, { jobId, reason: 'user' })
-    .then(r => console.log(`[cancel] job=${jobId} kill result=${JSON.stringify(r)}`))
-    .catch(e => console.error(`[cancel] job=${jobId} kill error:`, e && e.message || e));
+    .then(r => slog('info', '[cancel] kill result=' + JSON.stringify(r), { jobId, route: 'cancel' }))
+    .catch(e => slog('error', '[cancel] kill error: ' + (e && e.message || e), { jobId, route: 'cancel' }));
   return json(res, 200, { ok: true, jobId, state: job.state, cancelRequested: true });
 }
 
@@ -1359,6 +1401,27 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url, 'http://x');
+
+  // ISSUE-024: wrap res.end so we can emit one structured SLS line per
+  // request with statusCode + durationMs. We do this in addition to
+  // operationally meaningful slog() calls (job start/done/error etc).
+  const t0 = Date.now();
+  const _origEnd = res.end.bind(res);
+  res.end = function (...args) {
+    const dur = Date.now() - t0;
+    const status = res.statusCode || 0;
+    const lvl = status >= 500 ? 'error' : status >= 400 ? 'warn' : 'info';
+    // Only log POST /run* and the healthz failure; GET / and /v1info
+    // are noise.
+    const route = url.pathname;
+    if (route === '/run' || route === '/run-async' || route === '/healthz' || status >= 500) {
+      slog(lvl, 'http ' + req.method + ' ' + route + ' -> ' + status, {
+        route, statusCode: status, durationMs: dur,
+        method: req.method,
+      });
+    }
+    return _origEnd(...args);
+  };
 
   if (req.method === 'GET' && url.pathname === '/healthz') {  // async
     let dbOk = null;
@@ -1477,6 +1540,9 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[codex-api] listening on :${PORT}  user=${SANDBOX_USER}  authRequired=${!!SHARED_SECRET}`);
+  // ISSUE-024: announce SLS state so operators immediately see whether
+  // structured logging is shipping or fell back to stdout-only.
+  console.log(sls.banner());
   // Pre-warm codex binary in the background so the first user request avoids
   // the 200-800ms Rust cold-start. Fires once, errors are non-fatal.
   try {
