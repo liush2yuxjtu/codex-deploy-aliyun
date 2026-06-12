@@ -864,7 +864,11 @@ async function resolveUser(req) {
     return m ? m[1].trim() : '';
   })();
   const xUser = (req.headers['x-codex-user'] || '').toString().trim();
-  const token = bearer || xUser;
+  // mu-008: EventSource can't set custom headers, so we also accept the
+  // user token via the `?token=<…>` query param. The `?key=` query param
+  // is reserved for SHARED_SECRET (system user) and stays unchanged.
+  const urlToken = (url.searchParams.get('token') || '').toString().trim();
+  const token = bearer || xUser || urlToken;
 
   // Path 1: system via DEMO_SECRET (header or ?key=).
   if (SHARED_SECRET && (demoKey === SHARED_SECRET || urlKey === SHARED_SECRET)) {

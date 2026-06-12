@@ -408,6 +408,14 @@
       <label>Demo Key (后端 ?key= / x-demo-key 头,留空表示不需要)</label>
       <input id="cfg-demokey" placeholder="(可选)" />
     </div>
+    <div class="field">
+      <label>User Token <span style="color:var(--text-faint);font-weight:400;">(多用户隔离 · 每条消息/历史都带上 <code style="font-family:'JetBrains Mono',monospace;">Authorization: Bearer</code>)</span></label>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input id="cfg-usertoken" type="password" placeholder="cdx_… 或 UUID(管理员分配)" style="flex:1;" />
+        <button class="btn ghost" type="button" onclick="testUserToken()" style="white-space:nowrap;">Test token</button>
+      </div>
+      <div id="cfg-usertoken-test-result" style="margin-top:6px;font-size:12px;font-family:'JetBrains Mono',monospace;min-height:16px;color:var(--text-faint);"></div>
+    </div>
     <div class="modal-actions">
       <button class="btn ghost" onclick="closeSettings()">取消</button>
       <button class="btn primary" onclick="saveSettings()">保存</button>
@@ -422,6 +430,17 @@ const cfg = {
   serverHasDefaultKey: false,
   defaultModel: '',
   demoKey:  localStorage.getItem('cfg.demoKey')  || '',
+  // mu-008: per-user identity token. When set, every fetch() to the backend
+  // carries `Authorization: Bearer <token>` and EventSource calls append
+  // `?token=<token>` (EventSource can't set custom headers). When empty,
+  // the UI falls back to system-user mode (?key=<DEMO_SECRET> if set,
+  // otherwise open-demo on SHARED_SECRET-empty servers).
+  userToken: localStorage.getItem('cfg.userToken') || '',
+  resolvedUserId: null,   // last userId /healthz echoed (for the test-token badge)
+  resolvedIsSystem: false,
+  // When the backend rejects our token (401), we disable the chat input
+  // until the user enters a fresh token. Cleared on saveSettings() / test.
+  tokenRejected: false,
 };
 let convos = JSON.parse(localStorage.getItem('convos') || '[]');
 let currentId = null;
@@ -432,6 +451,9 @@ function openSettings() {
   document.getElementById('cfg-endpoint').value = cfg.endpoint;
   document.getElementById('cfg-apikey').value   = cfg.apiKey;
   document.getElementById('cfg-demokey').value  = cfg.demoKey;
+  document.getElementById('cfg-usertoken').value = cfg.userToken;
+  document.getElementById('cfg-usertoken-test-result').textContent = '';
+  document.getElementById('cfg-usertoken-test-result').style.color = '';
   document.getElementById('modal').classList.add('open');
 }
 function closeSettings() { document.getElementById('modal').classList.remove('open'); }
@@ -439,15 +461,155 @@ function saveSettings() {
   cfg.endpoint = document.getElementById('cfg-endpoint').value.trim().replace(/\/$/, '');
   cfg.apiKey   = document.getElementById('cfg-apikey').value.trim();
   cfg.demoKey  = document.getElementById('cfg-demokey').value.trim();
+  cfg.userToken = document.getElementById('cfg-usertoken').value.trim();
   localStorage.setItem('cfg.endpoint', cfg.endpoint);
   localStorage.setItem('cfg.apiKey',   cfg.apiKey);
   localStorage.setItem('cfg.demoKey',  cfg.demoKey);
+  localStorage.setItem('cfg.userToken', cfg.userToken);
+  // Saving a new token clears the rejected-lock (mu-008 AC: "Re-enable
+  // when a new token is entered").
+  cfg.tokenRejected = false;
+  applyComposerLock();
   closeSettings();
   pingHealth();
+  testUserToken();  // surface the new identity immediately so the user
+                    // sees whether their token was accepted
+}
+
+// mu-008: hit GET /healthz with the current token and show the resolved
+// userId in the settings panel. Called from saveSettings() and from the
+// explicit "Test token" button. Treats 401 as the canonical rejection
+// signal (server-side resolveUser returns 401 with reason no_token /
+// token_invalid / token_revoked).
+async function testUserToken() {
+  const resultEl = document.getElementById('cfg-usertoken-test-result');
+  if (!resultEl) return;
+  if (!cfg.userToken) {
+    resultEl.textContent = '未设置 token(系统用户 / 开放 demo 模式)';
+    resultEl.style.color = 'var(--text-faint)';
+    cfg.resolvedUserId = null;
+    cfg.resolvedIsSystem = false;
+    cfg.tokenRejected = false;
+    applyComposerLock();
+    return;
+  }
+  resultEl.textContent = 'testing…';
+  resultEl.style.color = 'var(--text-faint)';
+  try {
+    const r = await fetch(cfg.endpoint + '/healthz', {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + cfg.userToken },
+    });
+    if (r.status === 401) {
+      cfg.resolvedUserId = null;
+      cfg.resolvedIsSystem = false;
+      cfg.tokenRejected = true;
+      applyComposerLock();
+      resultEl.textContent = '✕ rejected (401) — 联系管理员';
+      resultEl.style.color = 'var(--danger)';
+      return;
+    }
+    if (!r.ok) {
+      cfg.resolvedUserId = null;
+      cfg.tokenRejected = true;
+      applyComposerLock();
+      resultEl.textContent = '✕ 失败 HTTP ' + r.status;
+      resultEl.style.color = 'var(--danger)';
+      return;
+    }
+    const j = await r.json();
+    cfg.resolvedUserId = j.userId || null;
+    cfg.resolvedIsSystem = !!j.isSystem;
+    cfg.tokenRejected = false;
+    applyComposerLock();
+    resultEl.textContent = '✓ userId = ' + (cfg.resolvedUserId || '(null)') + (cfg.resolvedIsSystem ? ' · system' : '');
+    resultEl.style.color = 'var(--accent)';
+  } catch (e) {
+    cfg.tokenRejected = true;
+    applyComposerLock();
+    resultEl.textContent = '✕ 网络错误: ' + (e.message || e);
+    resultEl.style.color = 'var(--danger)';
+  }
+}
+
+// mu-008: lock / unlock the chat composer based on token state. The
+// 401 path disables the input + send button until a fresh token is
+// saved. The pdf mode stays usable (PDF jobs also need a token, but
+// we don't lock the PDF panel here — the underlying PDF endpoints
+// will surface 401 as a job-error message via the SSE stream).
+function applyComposerLock() {
+  const ta = document.getElementById('input');
+  const btn = document.getElementById('send-btn');
+  if (!ta || !btn) return;
+  if (cfg.tokenRejected) {
+    ta.disabled = true;
+    ta.placeholder = 'Token rejected — 请到设置里更换 token';
+    btn.disabled = true;
+  } else {
+    ta.disabled = false;
+    ta.placeholder = '问 Codex(每条消息独立沙箱)…';
+    toggleSend();
+  }
 }
 
 function endpointPath(path) {
-  return (cfg.endpoint || '') + path + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
+  // mu-008: build a fully-scoped URL.
+  //  - user-token path: ?token=<token> (EventSource-safe; takes priority
+  //    over the demo key because the user explicitly opted in).
+  //  - admin/demo path: ?key=<DEMO_SECRET> (unchanged).
+  //  - open-demo mode (no token, no demoKey): bare URL.
+  const params = [];
+  if (cfg.userToken) params.push('token=' + encodeURIComponent(cfg.userToken));
+  else if (cfg.demoKey) params.push('key=' + encodeURIComponent(cfg.demoKey));
+  const qs = params.length ? '?' + params.join('&') : '';
+  return (cfg.endpoint || '') + path + qs;
+}
+
+// mu-008: build headers for a fetch() call. Always sets content-type
+// for JSON bodies; attaches the user token via Authorization when set.
+function apiHeaders(extra) {
+  const h = Object.assign({}, extra || {});
+  if (cfg.userToken) h['Authorization'] = 'Bearer ' + cfg.userToken;
+  return h;
+}
+
+// mu-008: single source of truth for the 401 UX. Called from every
+// fetch wrapper. Surfaces a one-time toast + locks the composer.
+// Returns true when the caller should abort further processing.
+async function handleUnauthorized(scope) {
+  cfg.tokenRejected = true;
+  applyComposerLock();
+  showToast('Token rejected — contact admin', 'danger');
+  console.warn('[mu-008] 401 from', scope || '(unknown)');
+  return true;  // always abort
+}
+
+// Tiny toast helper. Stays minimal — no global state, no queue; the
+// US-5.4 AC only requires "a single toast" per 401.
+function showToast(message, kind) {
+  const existing = document.getElementById('codex-toast');
+  if (existing) existing.remove();
+  const el = document.createElement('div');
+  el.id = 'codex-toast';
+  const color = kind === 'danger' ? 'var(--danger)' : (kind === 'ok' ? 'var(--accent)' : 'var(--text)');
+  el.style.cssText = 'position:fixed;left:50%;bottom:32px;transform:translateX(-50%);padding:10px 18px;border-radius:10px;background:#1f1f1f;border:1px solid ' + color + ';color:' + color + ';font-size:13px;z-index:100;box-shadow:0 8px 24px rgba(0,0,0,0.5);max-width:80vw;text-align:center;';
+  el.textContent = message;
+  document.body.appendChild(el);
+  setTimeout(() => { try { el.remove(); } catch {} }, 5000);
+}
+
+// mu-008: thin fetch wrapper. Sets the Authorization header from
+// cfg.userToken, treats any 401 as the rejection signal (so the
+// composer locks), and otherwise returns the raw Response for the
+// caller to inspect.
+async function apiFetch(url, opts) {
+  const o = Object.assign({}, opts || {});
+  o.headers = apiHeaders(o.headers || {});
+  const r = await fetch(url, o);
+  if (r.status === 401) {
+    await handleUnauthorized(url);
+  }
+  return r;
 }
 
 async function pingHealth() {
@@ -456,12 +618,25 @@ async function pingHealth() {
   pill.className = 'endpoint-pill checking';
   text.textContent = 'checking ' + cfg.endpoint.replace(/^https?:\/\//, '');
   try {
-    const r = await fetch(cfg.endpoint + '/healthz', { method: 'GET' });
+    // mu-008: attach the user token (best-effort) so /healthz echoes the
+    // resolved userId back. Bare fetch — does NOT trigger the 401-lock,
+    // since this is the periodic liveness probe and the user-token UX
+    // goes through the explicit "Test token" button.
+    const r = await fetch(cfg.endpoint + '/healthz', { method: 'GET', headers: apiHeaders() });
     if (r.ok) {
-      try { const j = await r.json(); cfg.serverHasDefaultKey = !!j.serverHasDefaultKey; cfg.defaultModel = j.defaultModel || ''; } catch(_){}
+      try {
+        const j = await r.json();
+        cfg.serverHasDefaultKey = !!j.serverHasDefaultKey;
+        cfg.defaultModel = j.defaultModel || '';
+        if (j.userId) {
+          cfg.resolvedUserId = j.userId;
+          cfg.resolvedIsSystem = !!j.isSystem;
+        }
+      } catch(_){}
       pill.className = 'endpoint-pill';
       const tag = cfg.serverHasDefaultKey ? (' · server key ✓' + (cfg.defaultModel ? ' · ' + cfg.defaultModel : '')) : ' · (no server key)';
-      text.textContent = (cfg.endpoint || 'same-origin').replace(/^https?:\/\//, '') + ' online' + tag;
+      const userTag = cfg.resolvedUserId ? ' · ' + cfg.resolvedUserId + (cfg.resolvedIsSystem ? ' (system)' : '') : '';
+      text.textContent = (cfg.endpoint || 'same-origin').replace(/^https?:\/\//, '') + ' online' + tag + userTag;
     } else {
       pill.className = 'endpoint-pill offline';
       text.textContent = 'unhealthy (HTTP ' + r.status + ')';
@@ -487,7 +662,11 @@ let serverHistory = [];
 
 async function fetchHistory() {
   try {
-    const r = await fetch(cfg.endpoint + '/history?limit=50');
+    // mu-008: per-user filter — server returns only the caller's runs.
+    // Token travels via Authorization header (the apiFetch wrapper
+    // attaches it from cfg.userToken).
+    const r = await apiFetch(cfg.endpoint + '/history?limit=50');
+    if (!r || !r.ok) return;
     const j = await r.json();
     if (j && j.ok && Array.isArray(j.rows)) {
       serverHistory = j.rows;
@@ -502,7 +681,10 @@ async function loadHistoryRun(runId) {
   const turns = document.getElementById('turns');
   turns.innerHTML = '<div class="empty"><div style="color:var(--text-faint)">读取中…</div></div>';
   try {
-    const r = await fetch(cfg.endpoint + '/history/' + encodeURIComponent(runId));
+    const r = await apiFetch(cfg.endpoint + '/history/' + encodeURIComponent(runId));
+    if (!r || !r.ok) {
+      throw new Error((r && r.status === 404) ? 'not_found' : ('HTTP ' + (r && r.status)));
+    }
     const j = await r.json();
     if (!j || !j.ok) throw new Error(j && j.error || 'load failed');
     const row = j.row;
@@ -1039,7 +1221,8 @@ async function submitPdfUrl() {
   setPdfStatus('正在生成 PDF…');
   document.getElementById('pdf-url-btn').disabled = true;
   try {
-    const r = await fetch(endpointPath('/pdf/from-url?async=1'), {
+    // mu-008: apiFetch attaches the Bearer token. URL keeps ?async=1.
+    const r = await apiFetch(endpointPath('/pdf/from-url?async=1'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ url: sourceUrl, mode: 'webfirst' }),
@@ -1087,7 +1270,7 @@ async function submitPdfFile(file) {
     const body = new FormData();
     body.append('file', file, file.name);
     body.append('mode', 'webfirst');
-    const r = await fetch(endpointPath('/pdf/from-file?async=1'), { method: 'POST', body });
+    const r = await apiFetch(endpointPath('/pdf/from-file?async=1'), { method: 'POST', body });
     if (r.status === 202) {
       const j = await r.json();
       if (j && j.jobId) {
@@ -1271,10 +1454,9 @@ async function cancelAsyncJob(jobId, btn, turn) {
     turn.cancelling = true;
     turn.cancelledAt = performance.now();
   }
-  const url = cfg.endpoint + '/job/' + encodeURIComponent(jobId) + '/cancel'
-    + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
+  const url = endpointPath('/job/' + encodeURIComponent(jobId) + '/cancel');
   try {
-    const r = await fetch(url, { method: 'POST' });
+    const r = await apiFetch(url, { method: 'POST' });
     if (r.status === 404) {
       // ISSUE-005 (killJobTree) hasn't landed yet — backend route is missing.
       // Hide the button, don't error. UI is forward-compatible: when the
@@ -1379,15 +1561,23 @@ async function sendMessage() {
     if (useAsync) {
       await sendAsync(prompt, controller, assistantTurn, t0);
     } else {
-      const url = cfg.endpoint + '/run' + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
-      const r = await fetch(url, {
+      // mu-008: use the user-token path (Bearer header) when configured,
+      // otherwise fall back to the demo-key path (unchanged). The wrapper
+      // endpointPath() composes the URL; apiFetch() attaches Authorization.
+      const url = endpointPath('/run');
+      const r = await apiFetch(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ prompt, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}), timeoutSec: readTimeoutSec() }),
         signal: controller.signal,
       });
-      const j = await r.json();
-      Object.assign(assistantTurn, j, { pending: false, elapsedMs: performance.now() - t0 });
+      if (!r || !r.ok) {
+        const txt = (r && r.status === 401) ? 'unauthorized' : ('HTTP ' + (r && r.status));
+        Object.assign(assistantTurn, { pending: false, ok: false, error: txt, elapsedMs: performance.now() - t0 });
+      } else {
+        const j = await r.json();
+        Object.assign(assistantTurn, j, { pending: false, elapsedMs: performance.now() - t0 });
+      }
     }
   } catch (e) {
     const cancelled = e.name === 'AbortError';
@@ -1408,16 +1598,19 @@ async function sendMessage() {
 // Updates the turn card live with the job's state and final result.
 async function sendAsync(prompt, controller, assistantTurn, t0) {
   // 1. POST /run-async (short round-trip — server returns 202 + jobId)
-  const submitUrl = cfg.endpoint + '/run-async' + (cfg.demoKey ? '?key=' + encodeURIComponent(cfg.demoKey) : '');
-  const initResp = await fetch(submitUrl, {
+  // mu-008: user-token path goes through the bearer header (apiFetch),
+  // so the URL stays clean. demoKey path keeps the ?key= query string.
+  const submitUrl = endpointPath('/run-async');
+  const initResp = await apiFetch(submitUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ prompt, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}), timeoutSec: readTimeoutSec() }),
     signal: controller.signal,
   });
-  if (!initResp.ok) {
-    const txt = await initResp.text();
-    throw new Error('submit failed: HTTP ' + initResp.status + ' — ' + txt.slice(0, 200));
+  if (!initResp || !initResp.ok) {
+    const txt = await (initResp && initResp.text ? initResp.text() : Promise.resolve(''));
+    const status = (initResp && initResp.status) || 'unknown';
+    throw new Error('submit failed: HTTP ' + status + ' — ' + txt.slice(0, 200));
   }
   const init = await initResp.json();
   if (!init.async || !init.jobId) throw new Error('server did not return async jobId');
@@ -1454,7 +1647,12 @@ async function sendAsync(prompt, controller, assistantTurn, t0) {
   const openStream = () => {
     if (manualClosed || done) return;
     const params = new URLSearchParams();
-    if (cfg.demoKey) params.set('key', cfg.demoKey);
+    // mu-008: EventSource can't set custom headers. We pass the user
+    // token via the ?token= query param when present; demoKey via ?key=.
+    // Server-side resolveUser accepts both (the ?token= fallback landed
+    // alongside this slice).
+    if (cfg.userToken) params.set('token', cfg.userToken);
+    else if (cfg.demoKey) params.set('key', cfg.demoKey);
     if (lastEventId) params.set('resume', lastEventId);
     const url = baseEventsUrl + '?' + params.toString();
     es = new EventSource(url);
@@ -1546,7 +1744,18 @@ async function sendAsync(prompt, controller, assistantTurn, t0) {
   // with ?resume= so the server replays anything we missed.
   const probeThenSchedule = () => {
     if (done || manualClosed) return;
-    fetch(cfg.endpoint + '/job/' + assistantTurn.jobId).then(r => r.json()).then(s => {
+    // mu-008: send the user token via Authorization on the probe so we
+    // can detect a 401 (token rejected) and lock the composer instead of
+    // looping forever.
+    fetch(cfg.endpoint + '/job/' + assistantTurn.jobId, { headers: apiHeaders() }).then(async (r) => {
+      if (r.status === 401) {
+        await handleUnauthorized('/job/:id probe');
+        finish({ ok: false, error: 'token_rejected', runId: assistantTurn.runId });
+        return null;
+      }
+      return r.json();
+    }).then(s => {
+      if (!s) return;
       if (s.state === 'done' || s.state === 'error' || s.state === 'cancelled') {
         finish({ ok: !!s.ok, exitCode: s.exitCode, runId: s.runId, durationMs: s.durationMs, spawnMs: s.spawnMs, gatewayMs: s.gatewayMs, quotaExceeded: s.quotaExceeded, error: s.error, stdout: s.stdoutPreview || '', stderr: s.stderrPreview || '' });
         return;
