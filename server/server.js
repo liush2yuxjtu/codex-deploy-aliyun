@@ -341,6 +341,109 @@ function extractFinalAnswer(stdout) {
   return lines.slice(lastIdx + 1).join('\n').replace(/^\s+|\s+$/g, '');
 }
 
+// ─── live weather pre-processor ───
+// Codex's built-in web_search tool is unreliable for "current weather in
+// <city>" queries — it often returns nothing useful and the model falls
+// back to a seasonal guess (we saw "I couldn't pull a reliable live
+// weather feed" on a Beijing query when the actual reading was 24°C).
+//
+// We side-step that by calling wttr.in (free, no API key, accepts
+// English + Chinese city names) directly when the prompt looks like a
+// current-weather question, and prepending a compact summary to the
+// codex prompt as system context. The model then has real data to
+// answer with.
+//
+// Cache: per-city, 5 min TTL. wttr.in has soft rate limits; serving
+// repeat queries from cache also feels snappier.
+//
+// Failure: silent. If the call times out / 5xx / returns malformed
+// data, we return the original prompt unchanged. The chat still works
+// — it just falls back to whatever the model would have done.
+const WTTR_TIMEOUT_MS = 4000;
+const WTTR_CACHE_MS   = 5 * 60 * 1000;
+const WTTR_CACHE      = new Map();  // city (lowercased) -> { fetchedAt, summary }
+
+// Match "weather / temperature / how hot / forecast" + "in / for / at" + <city>
+// Tail tolerance for "today / now / right now / tonight / this week / ..."
+// to avoid capturing the temporal adverb as part of the city name.
+const WEATHER_PATTERN_EN = /\b(?:weather|forecast|temperature|how\s+(?:hot|cold|warm))\b[^?.!]{0,80}?\b(?:in|at|for|of)\s+([A-Za-z][A-Za-z\s,.-]{1,40}?)(?=\s*(?:\?|$|\.|,|\s+(?:today|tonight|tomorrow|now|right\s+now|later|this\s+(?:week|weekend|month)|currently)\b))/i;
+// Match "<city> + 今天/现在/.../天气/气温/温度/多少度" — non-greedy on city so
+// temporal adverbs (今天/现在/...) aren't swallowed into the city capture.
+// 2-10 CJK chars covers 北京/上海/广州市/乌鲁木齐市/etc.
+const WEATHER_PATTERN_CN_CITY_FIRST = /([一-鿿]{2,10}?)\s*(?:今天|现在|目前|这周|这会儿|天气|气温|温度|多少度)/;
+// Match "天气/气温/温度 + 在/于/的/怎么样 + <city>"
+const WEATHER_PATTERN_CN_CITY_LAST  = /(?:天气|气温|温度)\s*(?:在|于|的|怎么样|咋样)\s*([一-鿿]{2,10})/;
+
+function extractWeatherCity(prompt) {
+  if (!prompt || typeof prompt !== 'string') return null;
+  for (const re of [WEATHER_PATTERN_EN, WEATHER_PATTERN_CN_CITY_FIRST, WEATHER_PATTERN_CN_CITY_LAST]) {
+    const m = prompt.match(re);
+    if (!m) continue;
+    const city = (m[1] || '').trim().replace(/[?.!,;]+$/, '').replace(/\s+/g, ' ');
+    if (city.length >= 2) return city;
+  }
+  return null;
+}
+
+async function fetchWeatherSummary(city) {
+  if (!city) return null;
+  const key = city.toLowerCase();
+  const cached = WTTR_CACHE.get(key);
+  if (cached && (Date.now() - cached.fetchedAt) < WTTR_CACHE_MS) return cached.summary;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), WTTR_TIMEOUT_MS);
+  try {
+    const url = `https://wttr.in/${encodeURIComponent(city)}?format=j1`;
+    const r = await fetch(url, {
+      signal: ac.signal,
+      headers: { 'Accept': 'application/json', 'User-Agent': 'codex-deploy-aliyun/1.0' },
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const cur = j && j.current_condition && j.current_condition[0];
+    const area = j && j.nearest_area && j.nearest_area[0];
+    if (!cur) return null;
+    const desc = (cur.weatherDesc && cur.weatherDesc[0] && cur.weatherDesc[0].value || '').trim();
+    const resolvedName = (area && area.areaName && area.areaName[0] && area.areaName[0].value || city).trim();
+    const summary = {
+      city: resolvedName,
+      queriedAs: city,
+      tempC: cur.temp_C,
+      tempF: cur.temp_F,
+      feelsLikeC: cur.FeelsLikeC,
+      feelsLikeF: cur.FeelsLikeF,
+      humidity: cur.humidity,
+      desc,
+      observationTime: cur.observation_time,
+      fetchedAt: new Date().toISOString(),
+    };
+    WTTR_CACHE.set(key, { fetchedAt: Date.now(), summary });
+    return summary;
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildWeatherEnrichment(summary) {
+  return [
+    '[Live weather data from wttr.in — observed ' + summary.observationTime + ' UTC]',
+    summary.city + ': ' + summary.tempC + '°C (' + summary.tempF + '°F), ' + summary.desc +
+      ', feels like ' + summary.feelsLikeC + '°C, humidity ' + summary.humidity + '%.',
+    'Use this as the primary source. Do NOT fall back to seasonal guesses or say "I couldn\'t pull a live feed".',
+  ].join('\n');
+}
+
+async function maybeEnrichWithWeather(prompt) {
+  const city = extractWeatherCity(prompt);
+  if (!city) return { prompt, weather: null };
+  const summary = await fetchWeatherSummary(city);
+  if (!summary) return { prompt, weather: null };
+  const enriched = buildWeatherEnrichment(summary) + '\n\nUser: ' + prompt;
+  return { prompt: enriched, weather: summary };
+}
+
 // ─── async /run: in-memory job store + per-job EventEmitter for SSE ───
 const JOBS = new Map();              // jobId -> { state, emitter, ... }
 const JOBS_TTL_MS = 60 * 60 * 1000;  // GC finished jobs after 1h
@@ -1038,6 +1141,13 @@ async function handleRun(req, res) {
   if (!effectiveKey) return json(res, 400, { ok: false, error: 'missing apiKey: neither request body nor server has one' });
   const effectiveModel = model || SERVER_LLM_DEFAULT_MODEL || '';
 
+  // Live weather pre-processor: if the prompt is a current-weather
+  // question, fetch from wttr.in and prepend a system-context block so
+  // the model uses real data instead of falling back to "I couldn't
+  // pull a live feed" + a seasonal guess. Records the summary on the
+  // response payload for frontend transparency.
+  const { prompt: effectivePrompt, weather } = await maybeEnrichWithWeather(prompt);
+
   const runId = randomUUID();
   const workDir = path.join(RUN_BASE, runId);
   fs.mkdirSync(workDir, { recursive: true, mode: 0o770 });
@@ -1073,9 +1183,9 @@ async function handleRun(req, res) {
   ];
   if (effectiveModel) codexArgs.push('-m', effectiveModel);
   if (sessionId) {
-    codexArgs.push('resume', sessionId, prompt);
+    codexArgs.push('resume', sessionId, effectivePrompt);
   } else {
-    codexArgs.push(prompt);
+    codexArgs.push(effectivePrompt);
   }
 
   const started = Date.now();
@@ -1130,17 +1240,17 @@ async function handleRun(req, res) {
     let payload, status;
     if (killed) {
       status = 504;
-      payload = { ok: false, exitCode: 124, error: 'timeout', runId, durationMs, spawnMs, gatewayMs, quotaExceeded, finalAnswer, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
+      payload = { ok: false, exitCode: 124, error: 'timeout', runId, durationMs, spawnMs, gatewayMs, quotaExceeded, finalAnswer, ...(weather ? { weather } : {}), stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: resumedOk,
         ...(requestedSessionId && !resumedOk ? { fallbackReason: 'session_not_found' } : {}) };
     } else if (code === 0) {
       status = 200;
-      payload = { ok: true, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, finalAnswer, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
+      payload = { ok: true, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, finalAnswer, ...(weather ? { weather } : {}), stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: resumedOk,
         ...(requestedSessionId && !resumedOk ? { fallbackReason: 'session_not_found' } : {}) };
     } else {
       status = 502;
-      payload = { ok: false, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, finalAnswer, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
+      payload = { ok: false, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, finalAnswer, ...(weather ? { weather } : {}), stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
         ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) };
     }
@@ -1195,6 +1305,12 @@ async function handleRunAsync(req, res) {
   if (!effectiveKey) return json(res, 400, { ok: false, error: 'missing apiKey: neither request body nor server has one' });
   const effectiveModel = model || SERVER_LLM_DEFAULT_MODEL || '';
 
+  // Live weather pre-processor — same as the sync path. The original
+  // prompt stays on the job (job.prompt is what gets recorded to RDS
+  // and shown in history); the enriched prompt is what we send to
+  // codex so the model can answer with real data.
+  const { prompt: effectivePrompt, weather } = await maybeEnrichWithWeather(prompt);
+
   const job = makeJob({
     id: newJobId(),
     state: 'pending',                 // pending -> running -> done|error
@@ -1204,6 +1320,7 @@ async function handleRunAsync(req, res) {
     spawnMs: 0, gatewayMs: 0, quotaExceeded: false,
     error: null, stdout: '', stderr: '',
     clientIp,
+    weather,                          // surfaced to the SSE 'done' event for frontend display
   });
   gcJob(job);
 
@@ -1268,7 +1385,7 @@ async function handleRunAsync(req, res) {
 
   let spawn;
   try {
-    spawn = startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientIp, sessionId });
+    spawn = startCodexJob({ prompt: effectivePrompt, effectiveKey, effectiveModel, timeoutS, clientIp, sessionId });
   } catch (e) {
     job.state = 'error';
     job.error = String(e && e.message || e);
@@ -1435,7 +1552,7 @@ async function handleRunAsync(req, res) {
       job.exitCode = 130;
       emitJob(job, 'cancelled', { ok: false, exitCode: 130, durationMs, error: job.error,
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false });
-      emitJob(job, 'done', { ok: false, exitCode: 130, durationMs, error: job.error, finalAnswer, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+      emitJob(job, 'done', { ok: false, exitCode: 130, durationMs, error: job.error, finalAnswer, ...(job.weather ? { weather: job.weather } : {}), stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
         ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) });
     } else if (job.killed) {
@@ -1443,20 +1560,20 @@ async function handleRunAsync(req, res) {
       job.ok = false;
       job.error = 'timeout';
       job.exitCode = 124;
-      emitJob(job, 'done', { ok: false, exitCode: 124, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, error: job.error, finalAnswer, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+      emitJob(job, 'done', { ok: false, exitCode: 124, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, error: job.error, finalAnswer, ...(job.weather ? { weather: job.weather } : {}), stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
         ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) });
     } else if (code === 0) {
       job.state = 'done';
       job.ok = true;
-      emitJob(job, 'done', { ok: true, exitCode: 0, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, finalAnswer, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+      emitJob(job, 'done', { ok: true, exitCode: 0, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, finalAnswer, ...(job.weather ? { weather: job.weather } : {}), stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: resumedOk,
         ...(requestedSessionId && !resumedOk ? { fallbackReason: 'session_not_found' } : {}) });
     } else {
       job.state = 'error';
       job.ok = false;
       job.error = 'codex exit ' + code;
-      emitJob(job, 'done', { ok: false, exitCode: code, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, finalAnswer, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+      emitJob(job, 'done', { ok: false, exitCode: code, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, finalAnswer, ...(job.weather ? { weather: job.weather } : {}), stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
         ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) });
     }
