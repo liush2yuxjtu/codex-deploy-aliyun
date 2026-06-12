@@ -1020,7 +1020,7 @@ async function runPdfScript(inputPath, slug, { onProgress } = {}) {
 // attach via EventSource to stream 'pdf-stdout' / 'pdf-stderr' /
 // 'pdf-done' / 'pdf-error' events back to the assistant turn.
 function enqueuePdfJob({ kind, label, sourcePath, slug, runner }) {
-  const job = makeJob({ kind, label, sourcePath, slug, state: 'pending', started: Date.now() });
+  const job = makeJob({ id: newJobId(), kind, label, sourcePath, slug, state: 'pending', started: Date.now() });
   emitJob(job, 'pdf-start', { kind, slug, sourcePath, label });
   // Fire and forget. The runner resolves the pdfPath on success; we
   // emit pdf-done with the OSS URL or fall back to a binary marker.
