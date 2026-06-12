@@ -701,50 +701,34 @@ function appendTurn(t) {
         }
       }
       if (t.stdout) {
-        if (t.finalAnswer) {
-          const details = document.createElement('details');
-          details.className = 'codex-raw';
-          details.style.cssText = 'margin-top: 10px; font-size: 12px; color: var(--text-dim);';
-          const summary = document.createElement('summary');
-          summary.style.cssText = 'cursor: pointer; user-select: none; padding: 4px 0;';
-          summary.textContent = '查看 Codex 原始输出 (' + t.stdout.length + ' 字符)';
-          details.appendChild(summary);
-          const pre = document.createElement('pre');
-          pre.className = 'code';
-          pre.style.cssText = 'margin-top: 6px; max-height: 360px; overflow: auto;';
-          pre.textContent = t.stdout;
-          details.appendChild(pre);
-          bubble.appendChild(details);
-        } else {
-          // No finalAnswer — render the raw transcript as the main content
-          // so history rows / error transcripts still carry the signal.
-          const pre = document.createElement('pre');
-          pre.className = 'code';
-          pre.textContent = t.stdout;
-          bubble.appendChild(pre);
-        }
+        // Always render stdout visibly — the codex CLI banner, model
+        // config, user-prompt echo, and final "codex" answer all live
+        // here. Users explicitly want to see this detail (banner + tokens
+        // used + reasoning summaries), so no <details> collapse.
+        const label = document.createElement('div');
+        label.style.cssText = 'margin-top: 10px; font-size: 11px; font-weight: 600; color: var(--text-dim); letter-spacing: 0.04em; text-transform: uppercase;';
+        label.textContent = 'stdout · ' + t.stdout.length + ' 字符';
+        bubble.appendChild(label);
+        const pre = document.createElement('pre');
+        pre.className = 'code';
+        pre.style.cssText = 'max-height: 360px; overflow: auto;';
+        pre.textContent = t.stdout;
+        bubble.appendChild(pre);
       }
       if (t.stderr) {
-        if (t.finalAnswer) {
-          const details = document.createElement('details');
-          details.className = 'codex-raw-stderr';
-          details.style.cssText = 'margin-top: 6px; font-size: 12px; color: var(--text-dim);';
-          const summary = document.createElement('summary');
-          summary.style.cssText = 'cursor: pointer; user-select: none; padding: 4px 0;';
-          summary.textContent = '查看 Codex stderr (' + t.stderr.length + ' 字符)';
-          details.appendChild(summary);
-          const pre = document.createElement('pre');
-          pre.className = 'code stderr';
-          pre.style.cssText = 'margin-top: 6px; max-height: 240px; overflow: auto;';
-          pre.textContent = t.stderr;
-          details.appendChild(pre);
-          bubble.appendChild(details);
-        } else {
-          const pre = document.createElement('pre');
-          pre.className = 'code stderr';
-          pre.textContent = t.stderr;
-          bubble.appendChild(pre);
-        }
+        // Always render stderr visibly too — codex writes the CLI
+        // banner, "Reading additional input from stdin…", session id,
+        // tokens used, and any error trace here. Same reasoning as
+        // stdout: hide-nothing chat UX.
+        const label = document.createElement('div');
+        label.style.cssText = 'margin-top: 10px; font-size: 11px; font-weight: 600; color: var(--text-dim); letter-spacing: 0.04em; text-transform: uppercase;';
+        label.textContent = 'stderr · ' + t.stderr.length + ' 字符';
+        bubble.appendChild(label);
+        const pre = document.createElement('pre');
+        pre.className = 'code stderr';
+        pre.style.cssText = 'max-height: 240px; overflow: auto;';
+        pre.textContent = t.stderr;
+        bubble.appendChild(pre);
       }
       const meta = document.createElement('div');
       meta.className = 'turn-meta';
