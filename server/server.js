@@ -2099,6 +2099,7 @@ const server = http.createServer(async (req, res) => {
 
   // ─── history ───
   if (req.method === 'GET' && url.pathname === '/history') {
+    if (!checkAuth(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
     if (!pgPool) return json(res, 200, { ok: true, rows: [], note: 'no db configured' });
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 200);
     try {
@@ -2116,6 +2117,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
   if (req.method === 'GET' && url.pathname.startsWith('/history/')) {
+    if (!checkAuth(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
     if (!pgPool) return json(res, 404, { ok: false, error: 'no db' });
     const runId = url.pathname.slice('/history/'.length);
     try {
