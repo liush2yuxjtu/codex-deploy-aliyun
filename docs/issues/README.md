@@ -130,7 +130,7 @@ graph TD
 | [021](021-rds-migrate.md) | rds-migrate.sh idempotent migration applier | v3A | ✅ done | `6d932d1` |
 | [022](022-oss-pdf-bucket.md) | OSS PDF bucket + presigned URL 落点 | v3B | ⏳ spec | — |
 | [023](023-network-reachability.md) | SWAS-cs → RDS-cb 网络可达性诊断 | v3B | ⏳ spec | — |
-| [024](024-sls-logging.md) | codex-api 日志 → SLS,告别 journalctl | v3B | ⏳ spec | — |
+| [024](024-sls-logging.md) | codex-api 日志 → SLS,告别 journalctl | v3B | ✅ done | `55421eb` |
 | [025](025-ecs-code-deploy.md) | ecs-code-deploy.sh idempotent atomic deploy | v3A | ✅ done | `ae4401b` |
 
 v3 候选出处:`/aliyun-start` deep research,见 `/tmp/...` 报告或 handoff v2 doc 末尾。

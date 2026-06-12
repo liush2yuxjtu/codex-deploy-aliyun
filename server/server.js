@@ -37,10 +37,15 @@ function slog(level, message, fields) {
   else console.log(line);
   sls.logToSls(level, message, fields);
 }
-const SECRET_FILE = '/etc/codex-api/secret.env';
+const SECRET_FILE = process.env.SECRET_FILE || '/etc/codex-api/secret.env';
 let RDS_HOST='', RDS_PORT=5432, RDS_DB='', RDS_USER='', RDS_PASSWORD='';
 let SERVER_LLM_API_KEY = '';
 let SERVER_LLM_DEFAULT_MODEL = '';
+// ISSUE-022: OSS PDF bucket — /pdf outputs uploaded here, presigned URL
+// returned to client. Missing creds ⇒ uploadPdfToOss() throws and the /pdf
+// handler falls back to streaming the PDF binary (backward compat).
+let OSS_BUCKET='', OSS_REGION='', OSS_ACCESS_KEY_ID='', OSS_ACCESS_KEY_SECRET='';
+let OSS_PRESIGN_TTL_SEC = 3600;
 try {
   const txt = require('fs').readFileSync(SECRET_FILE, 'utf8');
   for (const line of txt.split('\n')) {
@@ -53,10 +58,21 @@ try {
     if (m[1] === 'RDS_DB') RDS_DB = m[2].trim();
     if (m[1] === 'RDS_USER') RDS_USER = m[2].trim();
     if (m[1] === 'RDS_PASSWORD') RDS_PASSWORD = m[2].trim();
+    if (m[1] === 'OSS_BUCKET') OSS_BUCKET = m[2].trim();
+    if (m[1] === 'OSS_REGION') OSS_REGION = m[2].trim();
+    if (m[1] === 'OSS_ACCESS_KEY_ID') OSS_ACCESS_KEY_ID = m[2].trim();
+    if (m[1] === 'OSS_ACCESS_KEY_SECRET') OSS_ACCESS_KEY_SECRET = m[2].trim();
+    if (m[1] === 'OSS_PRESIGN_TTL_SEC') OSS_PRESIGN_TTL_SEC = Math.max(60, parseInt(m[2].trim(), 10) || 3600);
   }
   console.log('[codex-api] loaded server LLM key (' + SERVER_LLM_API_KEY.slice(0,12) + '…) default model=' + SERVER_LLM_DEFAULT_MODEL);
 } catch (e) {
   console.log('[codex-api] no secret file at', SECRET_FILE, '— requests must supply apiKey');
+}
+const OSS_ENABLED = !!(OSS_BUCKET && OSS_REGION && OSS_ACCESS_KEY_ID && OSS_ACCESS_KEY_SECRET);
+if (OSS_ENABLED) {
+  console.log('[codex-api] OSS pdf bucket enabled → ' + OSS_BUCKET + '@' + OSS_REGION + ' ttl=' + OSS_PRESIGN_TTL_SEC + 's');
+} else {
+  console.log('[codex-api] OSS pdf bucket disabled (missing OSS_BUCKET/OSS_REGION/OSS_ACCESS_KEY_*) — /pdf will stream binary as before');
 }
 
 // ─── pg pool (history persistence) ───
@@ -553,6 +569,201 @@ function json(res, status, obj) {
   res.end(body);
 }
 
+// ─── uploadPdfToOss: raw signed PUT + signed GET (ISSUE-022) ───
+// We deliberately avoid @alicloud/oss: (a) the SDK adds a few hundred KB to
+// server.js startup, (b) the upload is best-effort and one-shot, (c) the
+// only API surface we need is "put object" + "presign GET for N seconds".
+// Both fit in ~80 lines of crypto + https. Aliyun OSS uses a slightly
+// non-standard signature (v4 with the x-oss-date header) but the canonical
+// request shape is documented and stable.
+const https = require('https');
+const crypto = require('crypto');
+
+function hmac(key, data) {
+  return crypto.createHmac('sha256', key).update(data, 'utf8').digest();
+}
+function hmacHex(key, data) {
+  return crypto.createHmac('sha256', key).update(data, 'utf8').digest('hex');
+}
+function sha256Hex(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+function toUtcDate(d) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getUTCFullYear() + pad(d.getUTCMonth() + 1) + pad(d.getUTCDate())
+    + 'T' + pad(d.getUTCHours()) + pad(d.getUTCMinutes()) + pad(d.getUTCSeconds()) + 'Z';
+}
+function toUtcDateShort(d) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getUTCFullYear() + pad(d.getUTCMonth() + 1) + pad(d.getUTCDate());
+}
+
+// OSS v4 signing. Returns an Authorization header value.
+//   method: PUT | GET
+//   objectKey: pdfs/2026/06/foo-123.pdf
+//   extraQuery: { 'x-oss-date': '...', 'x-oss-expires': '300' } for presign
+//   extraHeaders: signed additional headers (empty for us — content-type is
+//     not strictly required and signing it would force clients to match)
+function ossSignV4(method, objectKey, { query = {}, headers = {}, bodyHash = 'UNSIGNED-PAYLOAD' } = {}) {
+  const now = new Date();
+  const xOssDate = toUtcDate(now);
+  const dateShort = toUtcDateShort(now);
+  const region = OSS_REGION;
+  const product = 'oss';
+  const credentialScope = dateShort + '/' + region + '/' + product + '/aliyun_v4_request';
+
+  // 1) Canonical query string
+  const sortedQueryKeys = Object.keys(query).sort();
+  const canonicalQuery = sortedQueryKeys
+    .map(k => encodeURIComponent(k) + '=' + encodeURIComponent(query[k] == null ? '' : String(query[k])))
+    .join('&');
+
+  // 2) Canonical headers — we only sign x-oss-date and host (required).
+  const signedHeaderKeys = ['x-oss-date', 'host'];
+  const canonicalHeaders =
+    'x-oss-date:' + xOssDate + '\n' +
+    'host:' + OSS_BUCKET + '.' + region + '.aliyuncs.com\n';
+  const signedHeaders = signedHeaderKeys.join(';');
+
+  // 3) Canonical request
+  const canonicalRequest = [
+    method,
+    '/' + encodeURI(objectKey).replace(/%2F/g, '/'),  // keep slashes unescaped
+    canonicalQuery,
+    canonicalHeaders,
+    signedHeaders,
+    bodyHash,
+  ].join('\n');
+
+  // 4) String to sign
+  const sts = [
+    'ALIYUN-V4-HMAC-SHA256',
+    xOssDate,
+    credentialScope,
+    sha256Hex(Buffer.from(canonicalRequest, 'utf8')),
+  ].join('\n');
+
+  // 5) Derive signing key, compute signature
+  const kDate    = hmac('ALIYUN-V4' + OSS_ACCESS_KEY_SECRET, dateShort);
+  const kRegion  = hmac(kDate, region);
+  const kProduct = hmac(kRegion, product);
+  const kSigning = hmac(kProduct, 'aliyun_v4_request');
+  const signature = hmacHex(kSigning, sts);
+
+  return 'ALIYUN-V4-HMAC-SHA256 Credential=' + OSS_ACCESS_KEY_ID + '/' + credentialScope
+    + ',SignedHeaders=' + signedHeaders + ',Signature=' + signature;
+}
+
+// Build a presigned GET URL (signed query string, no Authorization header).
+// Used to hand clients a downloadUrl that expires in OSS_PRESIGN_TTL_SEC.
+function ossPresignGet(objectKey, ttlSec) {
+  const now = new Date();
+  const xOssDate = toUtcDate(now);
+  const dateShort = toUtcDateShort(now);
+  const region = OSS_REGION;
+  const product = 'oss';
+  const credentialScope = dateShort + '/' + region + '/' + product + '/aliyun_v4_request';
+
+  const query = {
+    'x-oss-date': xOssDate,
+    'x-oss-expires': String(ttlSec),
+    'x-oss-signature-version': 'OSS4-HMAC-SHA256',
+  };
+  const sortedKeys = Object.keys(query).sort();
+  const canonicalQuery = sortedKeys
+    .map(k => encodeURIComponent(k) + '=' + encodeURIComponent(query[k]))
+    .join('&');
+
+  const canonicalRequest = [
+    'GET',
+    '/' + encodeURI(objectKey).replace(/%2F/g, '/'),
+    canonicalQuery,
+    '',           // no headers to sign
+    'UNSIGNED-PAYLOAD',
+  ].join('\n');
+
+  const sts = [
+    'OSS4-HMAC-SHA256',
+    xOssDate,
+    credentialScope,
+    sha256Hex(Buffer.from(canonicalRequest, 'utf8')),
+  ].join('\n');
+
+  const kDate    = hmac('OSS4' + OSS_ACCESS_KEY_SECRET, dateShort);
+  const kRegion  = hmac(kDate, region);
+  const kProduct = hmac(kRegion, product);
+  const kSigning = hmac(kProduct, 'aliyun_v4_request');
+  const sig = hmacHex(kSigning, sts);
+
+  const host = OSS_BUCKET + '.' + region + '.aliyuncs.com';
+  const finalQuery = canonicalQuery
+    + '&x-oss-signature=' + encodeURIComponent(sig);
+  return { url: 'https://' + host + '/' + encodeURI(objectKey).replace(/%2F/g, '/') + '?' + finalQuery,
+           host, finalQuery };
+}
+
+// PUT a buffer to OSS. Resolves with the objectKey on 2xx; throws otherwise.
+function ossPutObject(objectKey, buffer, contentType) {
+  return new Promise((resolve, reject) => {
+    const xOssDate = toUtcDate(new Date());
+    const host = OSS_BUCKET + '.' + OSS_REGION + '.aliyuncs.com';
+    const auth = ossSignV4('PUT', objectKey, { headers: { 'x-oss-date': xOssDate }, bodyHash: sha256Hex(buffer) });
+    const path = '/' + encodeURI(objectKey).replace(/%2F/g, '/');
+    const req = https.request({
+      method: 'PUT',
+      host: host,
+      path: path,
+      headers: {
+        'Authorization': auth,
+        'x-oss-date': xOssDate,
+        'Content-Type': contentType || 'application/pdf',
+        'Content-Length': buffer.length,
+        'x-oss-content-sha256': sha256Hex(buffer),
+      },
+      timeout: 15000,
+    }, (resp) => {
+      const chunks = [];
+      resp.on('data', c => chunks.push(c));
+      resp.on('end', () => {
+        if (resp.statusCode >= 200 && resp.statusCode < 300) return resolve(objectKey);
+        const body = Buffer.concat(chunks).toString('utf8').slice(0, 500);
+        reject(new Error('OSS PUT ' + resp.statusCode + ' ' + resp.statusCodeText + ' — ' + body));
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(new Error('OSS PUT timeout')); });
+    req.end(buffer);
+  });
+}
+
+// Upload a PDF buffer and return { ossKey, downloadUrl, expiresAt, size }.
+// Throws if OSS is not configured or the upload fails.
+async function uploadPdfToOss(buffer, slug) {
+  if (!OSS_ENABLED) throw new Error('oss not configured');
+  if (!buffer || !buffer.length) throw new Error('empty pdf buffer');
+  const now = new Date();
+  const yyyy = String(now.getUTCFullYear());
+  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+  // timestamp suffix to keep unique under parallel calls of the same slug
+  const ts = now.getTime().toString(36);
+  const safeSlug = (slug || 'doc').toString().replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 60) || 'doc';
+  const objectKey = 'pdfs/' + yyyy + '/' + mm + '/' + safeSlug + '-' + ts + '.pdf';
+  await ossPutObject(objectKey, buffer, 'application/pdf');
+  const { url } = ossPresignGet(objectKey, OSS_PRESIGN_TTL_SEC);
+  const expiresAt = new Date(Date.now() + OSS_PRESIGN_TTL_SEC * 1000).toISOString();
+  return { ossKey: objectKey, downloadUrl: url, expiresAt, size: buffer.length };
+}
+
+// In-memory cache of slug → most-recent presigned URL. Lets GET /pdf/oss/:slug
+// hand the same client a fresh presign after the original expired (within the
+// retention window). The cache evicts itself on a 60s rolling basis.
+const OSS_URL_CACHE = new Map();   // slug → { ossKey, downloadUrl, expiresAt, size, cachedAt }
+const OSS_URL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;  // 6h — well past 1h presign so refresh works
+setInterval(() => {
+  const cutoff = Date.now() - OSS_URL_CACHE_TTL_MS;
+  for (const [k, v] of OSS_URL_CACHE) if (v.cachedAt < cutoff) OSS_URL_CACHE.delete(k);
+}, 60 * 1000).unref?.();
+
 // ─── /pdf: md/html → PDF via md-to-pdf-webfirst skill ───
 const PDF_SKILL_DIR  = process.env.PDF_SKILL_DIR
   || path.join(os.homedir(), '.codex', 'skills', 'md-to-pdf-webfirst');
@@ -662,11 +873,39 @@ async function handlePdfUrl(req, res) {
   try {
     const { pdfPath, ms } = await runPdfScript(url, slug);
     const pdf = fs.readFileSync(pdfPath);
+    // ISSUE-022: try OSS first; fall back to streaming the binary if upload
+    // fails or OSS is unconfigured. Log full detail server-side, return
+    // the v1 binary shape so existing clients keep working.
+    if (OSS_ENABLED) {
+      try {
+        const oss = await uploadPdfToOss(pdf, slug);
+        // The cache entry maps slug → last known ossKey so /pdf/oss/:slug can
+        // mint a fresh presign after the original expires.
+        OSS_URL_CACHE.set(slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
+        return json(res, 200, {
+          ok: true, fallback: false,
+          url: oss.downloadUrl, expiresAt: oss.expiresAt, ossKey: oss.ossKey,
+          size: oss.size, pages: null, slug, kind: 'from-url',
+          xPdfMs: ms, pdfMs: ms,
+          // Backward-compat: the new-shape includes both `url` and
+          // `downloadUrl` so future frontends can pick a name.
+          downloadUrl: oss.downloadUrl,
+        });
+      } catch (e) {
+        console.error('[pdf:url] oss upload failed, falling back to binary:', e && e.message || e);
+        res.setHeader('X-Pdf-Oss-Fallback', 'true');
+      }
+    }
     res.writeHead(200, {
       'Content-Type': 'application/pdf',
       'Content-Length': pdf.length,
       'Content-Disposition': 'attachment; filename="' + slug + '.pdf"',
       'X-Pdf-Ms': String(ms),
+      // ISSUE-022: deprecation hint. v1 still works for now, but the v2 path
+      // (OSS + JSON) is the new contract. Frontend should switch.
+      'Deprecation': 'true',
+      'Sunset': 'Wed, 02 Jul 2026 00:00:00 GMT',
+      'Link': '</pdf/from-url>; rel="successor-version"',
     });
     return res.end(pdf);
   } catch (e) {
@@ -702,17 +941,53 @@ async function handlePdfUpload(req, res) {
   try {
     const { pdfPath, ms } = await runPdfScript(tmpPath, slug);
     const pdf = fs.readFileSync(pdfPath);
+    if (OSS_ENABLED) {
+      try {
+        const oss = await uploadPdfToOss(pdf, slug);
+        OSS_URL_CACHE.set(slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
+        return json(res, 200, {
+          ok: true, fallback: false,
+          url: oss.downloadUrl, expiresAt: oss.expiresAt, ossKey: oss.ossKey,
+          size: oss.size, pages: null, slug, kind: 'from-upload',
+          xPdfMs: ms, pdfMs: ms,
+          downloadUrl: oss.downloadUrl,
+        });
+      } catch (e) {
+        console.error('[pdf:upload] oss upload failed, falling back to binary:', e && e.message || e);
+        res.setHeader('X-Pdf-Oss-Fallback', 'true');
+      }
+    }
     res.writeHead(200, {
       'Content-Type': 'application/pdf',
       'Content-Length': pdf.length,
       'Content-Disposition': 'attachment; filename="' + slug + '.pdf"',
       'X-Pdf-Ms': String(ms),
+      'Deprecation': 'true',
+      'Sunset': 'Wed, 02 Jul 2026 00:00:00 GMT',
+      'Link': '</pdf/upload>; rel="successor-version"',
     });
     return res.end(pdf);
   } catch (e) {
     return json(res, 500, { ok: false, error: sanitizePdfError(e, 'upload') });
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}
+  }
+}
+
+// GET /pdf/oss/:slug — re-mint a presigned URL for the last upload matching
+// this slug. Returns 404 if we never uploaded one (or it has aged out of the
+// in-memory cache). The cache TTL is 6h and the presigned URL TTL is 1h by
+// default, so a hit inside the cache always gives a fresh presign.
+function handlePdfOss(req, res, slug) {
+  if (!OSS_ENABLED) return json(res, 503, { ok: false, error: 'oss not configured' });
+  const entry = OSS_URL_CACHE.get(slug);
+  if (!entry) return json(res, 404, { ok: false, error: 'no cached pdf for slug=' + slug + ' (was it uploaded by this server instance?)' });
+  try {
+    const { url } = ossPresignGet(entry.ossKey, OSS_PRESIGN_TTL_SEC);
+    const expiresAt = new Date(Date.now() + OSS_PRESIGN_TTL_SEC * 1000).toISOString();
+    return json(res, 200, { ok: true, slug, url, downloadUrl: url, expiresAt, ossKey: entry.ossKey, size: entry.size, fallback: false });
+  } catch (e) {
+    return json(res, 500, { ok: false, error: 'presign failed: ' + (e && e.message || e) });
   }
 }
 
@@ -1441,6 +1716,7 @@ const server = http.createServer(async (req, res) => {
         installed: fs.existsSync(PDF_SCRIPT),
         outputDir: PDF_OUTPUT_DIR,
       },
+      oss: OSS_ENABLED ? { bucket: OSS_BUCKET, region: OSS_REGION, presignTtlSec: OSS_PRESIGN_TTL_SEC } : { enabled: false },
     });
   }
   if (req.method === 'GET' && url.pathname === '/v1info') {
@@ -1485,6 +1761,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && (url.pathname === '/pdf/upload' || url.pathname === '/pdf/from-file')) {
     try { return await handlePdfUpload(req, res); }
     catch (e) { return json(res, 500, { ok: false, error: String(e && e.message || e) }); }
+  }
+  // ─── /pdf/oss/:slug — re-presign a previously uploaded PDF ───
+  if (req.method === 'GET' && url.pathname.startsWith('/pdf/oss/')) {
+    const slug = decodeURIComponent(url.pathname.slice('/pdf/oss/'.length));
+    if (!slug || !/^[A-Za-z0-9._-]+$/.test(slug)) return json(res, 400, { ok: false, error: 'bad slug' });
+    return handlePdfOss(req, res, slug);
   }
   // ─── static frontend ───
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {

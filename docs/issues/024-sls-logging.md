@@ -14,7 +14,9 @@ risk: medium
 effort: large
 expected_commits: 4
 ready_for_agent: true
-status: pending
+status: done
+merged_commit: 55421eb
+closed_at: 2026-06-12
 ---
 
 # ISSUE-024: codex-api 日志 → SLS,告别 journalctl
