@@ -1,0 +1,42 @@
+---
+id: mu-006
+title: per-user PDF output dir + OSS prefix + pdf_jobs table + owner-scoped /pdf/{oss,file}
+us: US-3.1, US-3.2, US-3.3, US-3.4, US-3.5, US-3.6, US-3.7
+parallel_group: M-W2B
+type: AFK
+round: 2
+mock: false
+blocked_by:
+  - mu-001
+files:
+  - migrations/006_pdf_jobs.sql
+  - server/server.js
+risk: medium
+effort: medium
+expected_commits: 2
+ready_for_agent: true
+status: pending
+triage: ready-for-agent
+---
+
+# mu-006: per-user PDF output dir + OSS prefix + owner-scoped /pdf/{oss,file}
+
+## What to build
+
+Scope every PDF write path and read path by `req.user.id`. **Three commits**:
+
+1. **Migration** — `migrations/006_pdf_jobs.sql`. `CREATE TABLE IF NOT EXISTS pdf_jobs (pdf_slug TEXT PRIMARY KEY, user_id TEXT NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, oss_key TEXT NULL, size_bytes BIGINT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_seen TIMESTAMPTZ NOT NULL DEFAULT now())`. Index `pdf_jobs_user_id_idx ON pdf_jobs(user_id, created_at DESC)`. `pdf_slug` is per-user unique (composite by user_id + slug); use `INSERT ... ON CONFLICT (pdf_slug) DO UPDATE SET last_seen=now()`.
+2. **Server paths** — `PDF_OUTPUT_DIR` becomes `/tmp/codex-pdf-out/<userId>/<slug>.pdf` (one subdir per user). `PDF_TMP_DIR` becomes `/tmp/codex-pdf-up/<userId>/…`. `OSS_URL_CACHE` becomes `Map<userId, Map<slug, …>>`. `uploadPdfToOss` prepends `pdfs/<userId>/<yyyy>/<mm>/` to the object key. On server boot, one-time backfill: walk `/tmp/codex-pdf-out/` and move any loose `<slug>.pdf` into `/tmp/codex-pdf-out/system/<slug>.pdf` (idempotent). `pdf_jobs` row written at the end of every successful PDF render.
+3. **Read paths** — `GET /pdf/oss/:slug` looks up `OSS_URL_CACHE[req.user.id].get(slug)` first, falls back to `pdf_jobs WHERE user_id=req.user.id AND pdf_slug=slug` for re-presign, 404 otherwise. `GET /pdf/file/:slug` resolves the per-user path, 404 on miss.
+
+## Acceptance criteria
+
+- [ ] Migration applies, idempotent.
+- [ ] Alice's `POST /pdf/from-url` produces `/tmp/codex-pdf-out/<aliceId>/<slug>.pdf` and an OSS object under `pdfs/<aliceId>/…`. Verify via `ls` + `ossutil ls`.
+- [ ] Bob's `POST /pdf/from-url` with the same slug lands in `/tmp/codex-pdf-out/<bobId>/<slug>.pdf`. No cross-user overwrite.
+- [ ] Alice's `GET /pdf/oss/<bob-slug>` returns 404.
+- [ ] Alice's own slug returns 200 with a fresh presigned URL.
+- [ ] Server restart re-presigns from the `pdf_jobs` row (cache miss → DB hit → fresh presign) for both Alice and Bob.
+- [ ] `/admin/users/<id>/stats` (from mu-001) returns `{ runs, jobs, pdfs, queued }` with `pdfs` reflecting the `pdf_jobs` row count.
+- [ ] `tests/multi-user.pdf.test.js` proves the 5 main cases.
+- [ ] Boot-time backfill is idempotent (running the server twice doesn't move files a second time).
