@@ -56,13 +56,27 @@ The SKILL.md should be roughly 200-300 lines. It is the contract that oa-002/003
 
 ## Acceptance criteria
 
-- [ ] `plugins/office-agents/.claude-plugin/plugin.json` exists, schema matches the afk-agents pattern.
-- [ ] `plugins/office-agents/skills/office-agents/SKILL.md` exists, ≥ 200 lines, self-contained (no external file references that aren't in the same plugin path).
-- [ ] SKILL.md's `## Process` section enumerates the 9 steps from PRD §5.
-- [ ] SKILL.md's `## Frontmatter schema` section lists exactly the 10 fields used by /afk-agents (no new fields; the existing schema is sufficient for ready-edge dispatch).
-- [ ] SKILL.md's `## State-log format` section shows a concrete JSONL example.
-- [ ] SKILL.md's `## Hard rules` section includes: no sub-skill spawn, no `open`/pop-open, no auto-re-trigger, non-blocking per pass, idempotent across re-triggers with no state change.
-- [ ] The plugin path mirrors the layout of the published afk-agents pack at `/tmp/afk-agents-plugins/plugins/afk-agents/` (same structure: `.claude-plugin/plugin.json` + `skills/<name>/SKILL.md`).
-- [ ] Two atomic commits: one for the manifest, one for the SKILL.md. (Per CLAUDE.md atomic-commit rule.)
-- [ ] `git push origin main` after each commit (CLAUDE.md rule #2).
-- [ ] No `scripts/` directory yet — that's oa-002/003/004.
+- [x] `plugins/office-agents/.claude-plugin/plugin.json` exists, schema matches the afk-agents pattern.
+- [x] `plugins/office-agents/skills/office-agents/SKILL.md` exists, ≥ 200 lines, self-contained (no external file references that aren't in the same plugin path).
+- [x] SKILL.md's `## Process` section enumerates the 9 steps from PRD §5.
+- [x] SKILL.md's `## Frontmatter schema` section lists exactly the 10 fields used by /afk-agents (no new fields; the existing schema is sufficient for ready-edge dispatch).
+- [x] SKILL.md's `## State-log format` section shows a concrete JSONL example.
+- [x] SKILL.md's `## Hard rules` section includes: no sub-skill spawn, no `open`/pop-open, no auto-re-trigger, non-blocking per pass, idempotent across re-triggers with no state change.
+- [x] The plugin path mirrors the layout of the published afk-agents pack at `/tmp/afk-agents-plugins/plugins/afk-agents/` (same structure: `.claude-plugin/plugin.json` + `skills/<name>/SKILL.md`).
+- [x] Two atomic commits: one for the manifest, one for the SKILL.md. (Per CLAUDE.md atomic-commit rule.)
+- [x] `git push origin main` after each commit (CLAUDE.md rule #2).
+- [x] No `scripts/` directory yet — that's oa-002/003/004.
+
+## Implementation Report
+
+- Files touched (within scope only): `plugins/office-agents/.claude-plugin/plugin.json` (+11), `plugins/office-agents/skills/office-agents/SKILL.md` (+383).
+- Commits: `60fec64` (manifest), `29ea1f2` (SKILL.md). Both pushed to `origin/main`.
+- Deploy: `scripts/ecs-code-deploy.sh` ran after each commit; both reported `deploy OK`. This slice ships docs only (plugin manifest + SKILL.md); the existing codex-api service was restarted as a safety per `feedback-always-deploy-immediately.md`, but the new artifacts only become discoverable once the user's Claude Code reloads its plugin index — no service-level behavior change.
+- Skipped / punted: none. All 10 AC are marked `[x]`.
+- Ambiguities resolved with a default (orchestrator can override):
+  - **Final-report filename**: AC doesn't specify. Defaulted to `.afk-agents-report.md` (same path as `/afk-agents`) with a `dispatcher: office` frontmatter discriminator, so `/afk-agents` and `/office-agents` reports can be distinguished by reading one line. Alternative would be a separate `.office-agents-report.md`; kept unified for grep-ability across the family of dispatcher reports.
+  - **Mock stub shape**: AC doesn't specify. Defaulted to "live in the slice `.md` file's `## Mock contract surface` body section, managed by orchestrator only" — mirrors `/afk-agents` exactly. No new files invented.
+  - **`mock_refines` → body pointer wording**: AC doesn't specify the exact text. Defaulted to "This mock is realized by `<real-id>`. See that slice for the real implementation." Same wording as `/afk-agents` so downstream readers see consistent tone.
+  - **State-log filename**: AC mentions `.office-agents-edge.log` as the default. Kept verbatim from slice body; not changed.
+  - **Hard-rule ordering**: AC lists 5 specific rules. The SKILL.md `## Hard rules` section carries those 5 plus 4 carried over from `/afk-agents` (no further subagent spawning, no user questions, no cross-slice edits, no frontmatter mutation by workers, mock bodies owned by orchestrator). Ordered as: carried-over first, then office-agents-specific. If the orchestrator prefers the 5 specific rules to lead, easy reorder.
+- Out-of-scope confirmations: no `scripts/` directory created (left for oa-002/003/004 per AC); no RDS / SWAS / credential changes (per conscious risk acceptance); no sub-skill spawn (Agent tool not used); no questions asked.
