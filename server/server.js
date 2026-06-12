@@ -1080,6 +1080,64 @@ async function loadPdfJobFromRds(pdfSlug, userId) {
   }
 }
 
+// mu-006: boot-time backfill. Move any loose <slug>.pdf files living at the
+// base of PDF_OUTPUT_BASE into the per-user system/ subdir, and ensure a
+// matching pdf_jobs row exists with user_id='system'. Idempotent — running
+// twice is a no-op because (a) system/<slug>.pdf already exists skips the
+// move, and (b) recordPdfJob's ON CONFLICT clause just bumps last_seen.
+// Best-effort: errors are logged, never thrown — boot must continue.
+function backfillLegacyPdfOutputs() {
+  try {
+    const base = PDF_OUTPUT_BASE;
+    if (!fs.existsSync(base)) return { moved: 0, skipped: 0, errors: 0 };
+    const sysDir = path.join(base, 'system');
+    fs.mkdirSync(sysDir, { recursive: true });
+    const entries = fs.readdirSync(base, { withFileTypes: true });
+    let moved = 0, skipped = 0, errors = 0;
+    for (const ent of entries) {
+      try {
+        if (!ent.isFile()) continue;
+        if (!ent.name.endsWith('.pdf')) continue;
+        // Skip the system/ subdir entry (it's a directory anyway) and
+        // any pre-existing per-user subdir entries.
+        const srcPath = path.join(base, ent.name);
+        const dstPath = path.join(sysDir, ent.name);
+        if (fs.existsSync(dstPath)) { skipped++; continue; }
+        try {
+          fs.renameSync(srcPath, dstPath);
+          moved++;
+        } catch (e) {
+          // cross-device rename (unlikely on /tmp, but defensive) → copy+unlink.
+          try {
+            fs.copyFileSync(srcPath, dstPath);
+            fs.unlinkSync(srcPath);
+            moved++;
+          } catch (e2) {
+            errors++;
+            slog('warn', '[pdf-backfill] failed to move ' + srcPath + ' → ' + dstPath + ': ' + (e2 && e2.message || e2), { source: 'pdf-backfill' });
+            continue;
+          }
+        }
+        // Fire-and-forget the pdf_jobs row. We don't await here because
+        // backfill runs before the server starts listening; the INSERT
+        // is best-effort anyway (recordPdfJob swallows DB errors).
+        const slug = ent.name.replace(/\.pdf$/, '');
+        recordPdfJob({ pdfSlug: slug, userId: 'system', kind: 'from-url', source: 'boot-backfill', ossKey: null, sizeBytes: null }).catch(() => {});
+      } catch (e) {
+        errors++;
+        slog('warn', '[pdf-backfill] entry error: ' + (e && e.message || e), { source: 'pdf-backfill' });
+      }
+    }
+    if (moved || skipped) {
+      slog('info', '[pdf-backfill] legacy pdfs at ' + base + ' → system/: moved=' + moved + ' skipped=' + skipped + ' errors=' + errors, { source: 'pdf-backfill' });
+    }
+    return { moved, skipped, errors };
+  } catch (e) {
+    slog('warn', '[pdf-backfill] top-level error: ' + (e && e.message || e), { source: 'pdf-backfill' });
+    return { moved: 0, skipped: 0, errors: 1 };
+  }
+}
+
 // ─── /pdf: md/html → PDF via md-to-pdf-webfirst skill ───
 const PDF_SKILL_DIR  = process.env.PDF_SKILL_DIR
   || path.join(os.homedir(), '.codex', 'skills', 'md-to-pdf-webfirst');
@@ -1313,17 +1371,18 @@ async function handlePdfUrl(req, res) {
     });
   }
   try {
-    const { pdfPath, ms } = await runPdfScript(url, slug);
+    const { pdfPath, ms } = await runPdfScript(url, slug, { userId });
     const pdf = fs.readFileSync(pdfPath);
     // ISSUE-022: try OSS first; fall back to streaming the binary if upload
     // fails or OSS is unconfigured. Log full detail server-side, return
     // the v1 binary shape so existing clients keep working.
     if (OSS_ENABLED) {
       try {
-        const oss = await uploadPdfToOss(pdf, slug);
-        // The cache entry maps slug → last known ossKey so /pdf/oss/:slug can
-        // mint a fresh presign after the original expires.
-        OSS_URL_CACHE.set(slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
+        const oss = await uploadPdfToOss(pdf, slug, { userId });
+        // The per-user cache entry lets /pdf/oss/:slug mint a fresh presign
+        // after the original expires — see US-3.2 (owner-scoped lookup).
+        ossUrlCachePut(userId, slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
+        await recordPdfJob({ pdfSlug: slug, userId, kind: 'from-url', source: url, ossKey: oss.ossKey, sizeBytes: pdf.length });
         return json(res, 200, {
           ok: true, fallback: false,
           url: oss.downloadUrl, expiresAt: oss.expiresAt, ossKey: oss.ossKey,
@@ -1375,9 +1434,12 @@ async function handlePdfUpload(req, res) {
   if (!['.md', '.markdown', '.html', '.htm'].includes(ext)) {
     return json(res, 400, { ok: false, error: 'unsupported file type: ' + ext + ' (allowed: .md .markdown .html .htm)' });
   }
-  fs.mkdirSync(PDF_TMP_DIR, { recursive: true });
+  // mu-006: per-user tmp dir; the per-user out dir is the same as handlePdfUrl's.
+  const userId = (req.user && req.user.id) || 'system';
+  const tmpBase = pdfTmpDir(userId);
+  fs.mkdirSync(tmpBase, { recursive: true });
   const safeName = file.filename.replace(/[^A-Za-z0-9._-]+/g, '_');
-  const tmpPath = path.join(PDF_TMP_DIR, Date.now() + '-' + safeName);
+  const tmpPath = path.join(tmpBase, Date.now() + '-' + safeName);
   fs.writeFileSync(tmpPath, file.data);
   const slug = pdfSlug(path.basename(safeName, ext));
   const wantAsync = String(req.headers['x-pdf-async'] || new URL(req.url, 'http://x').searchParams.get('async') || '') === '1';
@@ -1399,20 +1461,21 @@ async function handlePdfUpload(req, res) {
               emitJob(j, 'pdf-line', { stream, line });
             }
           };
-          const { pdfPath, ms } = await runPdfScript(tmpPath, slug, { onProgress });
+          const { pdfPath, ms } = await runPdfScript(tmpPath, slug, { onProgress, userId });
           const pdf = fs.readFileSync(pdfPath);
           let oss = null;
           if (OSS_ENABLED) {
             try {
-              oss = await uploadPdfToOss(pdf, slug);
-              OSS_URL_CACHE.set(slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
+              oss = await uploadPdfToOss(pdf, slug, { userId });
+              ossUrlCachePut(userId, slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
             } catch (e) {
               console.error('[pdf:from-upload async] oss upload failed:', e && e.message || e);
             }
           }
+          await recordPdfJob({ pdfSlug: slug, userId, kind: 'from-upload', source: tmpPath, ossKey: oss && oss.ossKey, sizeBytes: pdf.length });
           return { pdfPath, ms, oss };
         } finally {
-          // Always clean up the tmp upload, success or failure.
+          // Always clean up the per-user tmp upload, success or failure.
           try { fs.unlinkSync(tmpPath); } catch {}
         }
       },
@@ -1424,12 +1487,13 @@ async function handlePdfUpload(req, res) {
     });
   }
   try {
-    const { pdfPath, ms } = await runPdfScript(tmpPath, slug);
+    const { pdfPath, ms } = await runPdfScript(tmpPath, slug, { userId });
     const pdf = fs.readFileSync(pdfPath);
     if (OSS_ENABLED) {
       try {
-        const oss = await uploadPdfToOss(pdf, slug);
-        OSS_URL_CACHE.set(slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
+        const oss = await uploadPdfToOss(pdf, slug, { userId });
+        ossUrlCachePut(userId, slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
+        await recordPdfJob({ pdfSlug: slug, userId, kind: 'from-upload', source: tmpPath, ossKey: oss.ossKey, sizeBytes: pdf.length });
         return json(res, 200, {
           ok: true, fallback: false,
           url: oss.downloadUrl, expiresAt: oss.expiresAt, ossKey: oss.ossKey,
@@ -1463,14 +1527,33 @@ async function handlePdfUpload(req, res) {
 // this slug. Returns 404 if we never uploaded one (or it has aged out of the
 // in-memory cache). The cache TTL is 6h and the presigned URL TTL is 1h by
 // default, so a hit inside the cache always gives a fresh presign.
-function handlePdfOss(req, res, slug) {
+// mu-006: per-user OSS_URL_CACHE lookup, with pdf_jobs fallback on cache miss
+// (cache miss after server restart → look up (user_id, pdf_slug) row and
+// re-presign from the durable oss_key). 404 otherwise (US-3.2).
+async function handlePdfOss(req, res, slug) {
   if (!OSS_ENABLED) return json(res, 503, { ok: false, error: 'oss not configured' });
-  const entry = OSS_URL_CACHE.get(slug);
-  if (!entry) return json(res, 404, { ok: false, error: 'no cached pdf for slug=' + slug + ' (was it uploaded by this server instance?)' });
+  const userId = (req.user && req.user.id) || 'system';
+  const entry = ossUrlCacheGet(userId, slug);
+  if (entry) {
+    try {
+      const { url } = ossPresignGet(entry.ossKey, OSS_PRESIGN_TTL_SEC);
+      const expiresAt = new Date(Date.now() + OSS_PRESIGN_TTL_SEC * 1000).toISOString();
+      return json(res, 200, { ok: true, slug, url, downloadUrl: url, expiresAt, ossKey: entry.ossKey, size: entry.size, fallback: false });
+    } catch (e) {
+      return json(res, 500, { ok: false, error: 'presign failed: ' + (e && e.message || e) });
+    }
+  }
+  // Cache miss — fall back to the durable pdf_jobs row (US-3.2 + restart-resilience).
+  const row = await loadPdfJobFromRds(slug, userId);
+  if (!row || !row.oss_key) {
+    return json(res, 404, { ok: false, error: 'no pdf for slug=' + slug + ' (owned by user=' + userId + ')' });
+  }
   try {
-    const { url } = ossPresignGet(entry.ossKey, OSS_PRESIGN_TTL_SEC);
+    const { url } = ossPresignGet(row.oss_key, OSS_PRESIGN_TTL_SEC);
     const expiresAt = new Date(Date.now() + OSS_PRESIGN_TTL_SEC * 1000).toISOString();
-    return json(res, 200, { ok: true, slug, url, downloadUrl: url, expiresAt, ossKey: entry.ossKey, size: entry.size, fallback: false });
+    // Refresh the hot cache so subsequent hits within the TTL skip the DB.
+    ossUrlCachePut(userId, slug, { ossKey: row.oss_key, downloadUrl: url, expiresAt, size: row.size_bytes != null ? Number(row.size_bytes) : null, cachedAt: Date.now() });
+    return json(res, 200, { ok: true, slug, url, downloadUrl: url, expiresAt, ossKey: row.oss_key, size: row.size_bytes != null ? Number(row.size_bytes) : null, fallback: true, source: 'pdf_jobs' });
   } catch (e) {
     return json(res, 500, { ok: false, error: 'presign failed: ' + (e && e.message || e) });
   }
@@ -2255,7 +2338,8 @@ const server = http.createServer(async (req, res) => {
         skillDir: PDF_SKILL_DIR,
         script: PDF_SCRIPT,
         installed: fs.existsSync(PDF_SCRIPT),
-        outputDir: PDF_OUTPUT_DIR,
+        outputBase: PDF_OUTPUT_BASE,
+        outputDirSystem: pdfOutDir('system'),
       },
       oss: OSS_ENABLED ? { bucket: OSS_BUCKET, region: OSS_REGION, presignTtlSec: OSS_PRESIGN_TTL_SEC } : { enabled: false },
     });
@@ -2314,8 +2398,10 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname.startsWith('/pdf/file/')) {
     const slug = decodeURIComponent(url.pathname.slice('/pdf/file/'.length));
     if (!slug || !/^[A-Za-z0-9._-]+$/.test(slug)) return json(res, 400, { ok: false, error: 'bad slug' });
-    const pdfPath = path.join(PDF_OUTPUT_DIR, slug + '.pdf');
-    if (!fs.existsSync(pdfPath)) return json(res, 404, { ok: false, error: 'pdf not found for slug: ' + slug });
+    // mu-006: per-user local PDF (US-3.3). The async path's fileUrl points here.
+    const userId = (req.user && req.user.id) || 'system';
+    const pdfPath = path.join(pdfOutDir(userId), slug + '.pdf');
+    if (!fs.existsSync(pdfPath)) return json(res, 404, { ok: false, error: 'pdf not found for slug: ' + slug + ' (user=' + userId + ')' });
     const pdf = fs.readFileSync(pdfPath);
     res.writeHead(200, {
       'Content-Type': 'application/pdf',
@@ -2464,4 +2550,7 @@ server.listen(PORT, '0.0.0.0', () => {
     w.on('close', (code) => console.log(`[codex-api] pre-warm codex --version → exit ${code}`));
     w.on('error', (e) => console.log(`[codex-api] pre-warm skipped: ${e.message}`));
   } catch (e) { /* best effort */ }
+  // mu-006: one-shot boot-time backfill — move loose <slug>.pdf at the base
+  // of the per-user pdf output dir into system/ and write pdf_jobs rows.
+  try { backfillLegacyPdfOutputs(); } catch (e) { /* best effort */ }
 });
