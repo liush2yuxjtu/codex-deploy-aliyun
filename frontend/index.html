@@ -683,6 +683,22 @@ function appendTurn(t) {
         finalEl.style.cssText = 'white-space: pre-wrap; line-height: 1.6; font-size: 14px; color: var(--text); margin-top: 2px;';
         finalEl.textContent = t.finalAnswer;
         bubble.appendChild(finalEl);
+        // Live-data attribution: when the server pre-processor hit wttr.in
+        // and got real data, surface it as a small badge so the user can
+        // see the actual current reading and where it came from. Click →
+        // opens wttr.in's web UI for the same city (sanity-check the
+        // server's pick if needed).
+        if (t.weather && t.weather.tempC) {
+          const w = t.weather;
+          const badge = document.createElement('a');
+          badge.className = 'weather-badge';
+          badge.href = 'https://wttr.in/' + encodeURIComponent(w.queriedAs || w.city) + '?lang=zh';
+          badge.target = '_blank';
+          badge.rel = 'noopener noreferrer';
+          badge.style.cssText = 'display:inline-flex;align-items:center;gap:6px;margin-top:8px;padding:4px 10px;border-radius:999px;background:rgba(56,139,253,0.10);border:1px solid rgba(56,139,253,0.30);color:var(--accent,#388bfd);font-size:12px;text-decoration:none;line-height:1.4;';
+          badge.innerHTML = '<span>📍</span><span><strong>' + escapeHtml(w.city) + '</strong> · ' + escapeHtml(w.tempC) + '°C · ' + escapeHtml(w.desc || '') + '</span><span style="opacity:.55;">· wttr.in</span>';
+          bubble.appendChild(badge);
+        }
       }
       if (t.stdout) {
         if (t.finalAnswer) {
