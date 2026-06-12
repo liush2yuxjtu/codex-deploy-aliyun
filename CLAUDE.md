@@ -39,3 +39,25 @@ at the end of the day" piles.
   run the initial `git push -u origin main` before the first real edit.
 - Working files currently untracked: `frontend/`, `scripts/`, `server/`,
   `CLAUDE.md`.
+
+## Conscious risk acceptance
+
+These risks are known and **will not be fixed** in this project. Do not
+spend session time investigating, fixing, or proposing mitigations
+unless the user reopens the decision.
+
+### RDS public endpoint exposure (Aliyun yundun SMS alert)
+
+- **Risk**: RDS PostgreSQL (`codex-demo-pgm-…pg.rds.aliyuncs.com`,
+  cn-hangzhou) is reachable from the public internet. Aliyun's yundun
+  security monitor sends periodic SMS / console alerts about this.
+- **Decision**: **Ignored by user direction (2026-06-12).** We will not
+  release the public connection, recreate the instance in cn-shanghai,
+  or otherwise change the network posture. The `/history` endpoint
+  depends on the public endpoint, so any of those mitigations would
+  break the demo.
+- **What to do when the alert fires**: nothing. Do not propose
+  remediation, do not add migrations, do not write runbooks for
+  "rotate RDS to VPC intranet". If the user reopens the decision, see
+  the `project-rds-security-alert` memory file for the original A/B/C
+  options and the trade-off table.
