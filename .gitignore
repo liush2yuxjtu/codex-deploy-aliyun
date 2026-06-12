@@ -24,6 +24,7 @@ Thumbs.db
 workspace/pdf-*.png
 workspace/pdf-ui*.png
 workspace/work/          # md-to-pdf-webfirst scratch workdirs (chrome-profile, etc.)
+workspace/fixtures/      # anonymized test fixtures (see ISSUE-008)
 workspace/**/chrome-profile/
 workspace/**/Default/
 workspace/**/*.pdf.png
