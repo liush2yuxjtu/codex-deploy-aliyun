@@ -526,41 +526,86 @@ function gcJob(job) {
   setTimeout(() => { if (JOBS.get(job.id) === job) JOBS.delete(job.id); }, JOBS_TTL_MS).unref();
 }
 
-// ─── concurrency semaphore + FIFO queue (ISSUE-013) ───
-// Cap concurrent codex jobs to MAX_CONCURRENT_CODEX (default 3, env).
-// Excess requests join a FIFO queue of MAX_QUEUE_SIZE (default 6, env).
+// ─── concurrency semaphore + FIFO queue (ISSUE-013 + mu-007) ───
+// Two-layer semaphore (mu-007):
+//   1) global  — MAX_CONCURRENT_CODEX (default 3) hard wall across all users
+//   2) per-user — MAX_CONCURRENT_PER_USER (default 1) FIFO per userId
+// System user (req.user.isSystem === true) bypasses the per-user layer so
+// admin / legacy DEMO_SECRET flows keep their existing wall-clock behaviour.
+// Excess requests join a FIFO queue (global OR per-user, whichever is full).
 // Queue entries that wait more than MAX_QUEUE_WAIT_MS (30s) are rejected
 // with 503 queue_timeout; their child (if any) is killed via killJobTree.
-const MAX_CONCURRENT_CODEX = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CODEX || '3', 10) || 3);
-const MAX_QUEUE_SIZE       = Math.max(0, parseInt(process.env.MAX_QUEUE_SIZE || '6', 10) || 6);
-const MAX_QUEUE_WAIT_MS    = 30 * 1000;
+const MAX_CONCURRENT_CODEX    = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CODEX    || '3', 10) || 3);
+const MAX_CONCURRENT_PER_USER = Math.max(1, parseInt(process.env.MAX_CONCURRENT_PER_USER || '1', 10) || 1);
+const MAX_QUEUE_SIZE          = Math.max(0, parseInt(process.env.MAX_QUEUE_SIZE          || '6', 10) || 6);
+const MAX_QUEUE_WAIT_MS       = 30 * 1000;
 let activeCount = 0;
-const queue = [];   // [{ jobId, resolve, reject, timer, queuedAt }]
-
-function tryAcquireSlot() {
-  if (activeCount < MAX_CONCURRENT_CODEX) {
-    activeCount += 1;
-    return { acquired: true, mode: 'running' };
+const queue = [];   // global FIFO: [{ jobId, resolve, reject, timer, queuedAt, userId }]
+// userSlots: userId → { active: number, queued: [{ jobId, resolve, reject, timer, queuedAt }] }
+// Lazily created on first acquire by that userId. We never evict entries —
+// active/queued counters converge to 0 when the user goes idle.
+const userSlots = new Map();
+function getOrCreateUserSlot(userId) {
+  let slot = userSlots.get(userId);
+  if (!slot) {
+    slot = { active: 0, queued: [] };
+    userSlots.set(userId, slot);
   }
-  if (queue.length >= MAX_QUEUE_SIZE) {
-    return { acquired: false, mode: 'rejected', reason: 'queue_full' };
-  }
-  return { acquired: false, mode: 'queued' };
+  return slot;
 }
-function waitForSlot({ jobId }) {
+
+// mu-007: two-layer acquire. Returns one of:
+//   { acquired: true,  mode: 'running' }              — both slots granted
+//   { acquired: false, mode: 'queued',   scope: 'global' } — global full; queue
+//   { acquired: false, mode: 'queued',   scope: 'user'   } — user full; queue
+//   { acquired: false, mode: 'rejected', scope: 'global', reason: 'queue_full' }
+//   { acquired: false, mode: 'rejected', scope: 'user',   reason: 'queue_full' }
+// System user (isSystem === true) bypasses the per-user layer entirely.
+function tryAcquireSlot({ userId, isSystem } = {}) {
+  const uid = userId || 'anon';
+  const userSlot = isSystem ? null : getOrCreateUserSlot(uid);
+  const globalOk  = activeCount < MAX_CONCURRENT_CODEX;
+  const userOk    = isSystem ? true : userSlot.active < MAX_CONCURRENT_PER_USER;
+  if (globalOk && userOk) {
+    activeCount += 1;
+    if (!isSystem) userSlot.active += 1;
+    return { acquired: true, mode: 'running', scope: 'global' };
+  }
+  // Decide which scope to queue on. If global is the tighter one, use global;
+  // otherwise the per-user layer is full → per-user queue.
+  if (!globalOk) {
+    if (queue.length >= MAX_QUEUE_SIZE) {
+      return { acquired: false, mode: 'rejected', scope: 'global', reason: 'queue_full' };
+    }
+    return { acquired: false, mode: 'queued', scope: 'global' };
+  }
+  // Global has slots but this user's per-user slot is full.
+  if (userSlot.queued.length >= MAX_QUEUE_SIZE) {
+    return { acquired: false, mode: 'rejected', scope: 'user', reason: 'queue_full' };
+  }
+  return { acquired: false, mode: 'queued', scope: 'user' };
+}
+// mu-007: waitForSlot picks the global vs per-user queue by scope, and
+// stamps userId on each entry so cancelQueueWait / drain functions can
+// find the right bucket. The FIFO + MAX_QUEUE_WAIT_MS semantics from
+// ISSUE-013 are preserved bit-for-bit.
+function waitForSlot({ jobId, userId, isSystem, scope } = {}) {
+  const uid = userId || 'anon';
+  const isUserScope = scope === 'user';
+  const targetQueue = isUserScope ? getOrCreateUserSlot(uid).queued : queue;
   return new Promise((resolve, reject) => {
-    const entry = { jobId, resolve, reject, queuedAt: Date.now(), timer: null };
+    const entry = { jobId, resolve, reject, queuedAt: Date.now(), timer: null, userId: uid };
     entry.timer = setTimeout(() => {
-      const idx = queue.indexOf(entry);
+      const idx = targetQueue.indexOf(entry);
       if (idx === -1) return;
-      queue.splice(idx, 1);
+      targetQueue.splice(idx, 1);
       const e = new Error('queue timeout after ' + MAX_QUEUE_WAIT_MS + 'ms');
       e.queueReason = 'queue_timeout';
       e.queueWaitMs = Date.now() - entry.queuedAt;
       reject(e);
     }, MAX_QUEUE_WAIT_MS);
     entry.timer.unref?.();
-    queue.push(entry);
+    targetQueue.push(entry);
   });
 }
 function drainQueue() {
@@ -568,17 +613,64 @@ function drainQueue() {
     const next = queue.shift();
     if (next.timer) clearTimeout(next.timer);
     activeCount += 1;
+    // mu-007: a global-queued waiter whose userId is non-system also
+    // consumes a per-user slot at grant time. Otherwise the global
+    // acquire would let one user grab every global slot in a row.
+    if (next.userId && next.userId !== 'system') {
+      const us = getOrCreateUserSlot(next.userId);
+      us.active += 1;
+    }
     next.resolve({ mode: 'running' });
   }
 }
-function releaseSlot() {
+// mu-007: drain the per-user FIFO. Called from releaseSlot() whenever a
+// user releases their slot, BEFORE the global drain. While there is
+// per-user headroom, shift the FIFO head, bump active, grant the waiter.
+function drainUserQueue(userId) {
+  const slot = userSlots.get(userId);
+  if (!slot) return;
+  while (slot.active < MAX_CONCURRENT_PER_USER && slot.queued.length > 0) {
+    const next = slot.queued.shift();
+    if (next.timer) clearTimeout(next.timer);
+    activeCount += 1;
+    slot.active += 1;
+    next.resolve({ mode: 'running' });
+  }
+}
+// mu-007: signature now takes the releaser's userId + isSystem so we
+// can keep the per-user counter + per-user FIFO in sync. Order matters:
+// drain the per-user queue first (a waiter there was waiting on this
+// exact user slot), then drain the global queue (waiters there were
+// waiting on the global wall).
+function releaseSlot({ userId, isSystem } = {}) {
   if (activeCount > 0) activeCount -= 1;
+  if (!isSystem && userId) {
+    const slot = userSlots.get(userId);
+    if (slot && slot.active > 0) slot.active -= 1;
+    drainUserQueue(userId);
+  }
   drainQueue();
 }
-function cancelQueueWait(jobId, reason = 'cancelled') {
-  const idx = queue.findIndex(e => e.jobId === jobId);
-  if (idx === -1) return false;
-  const entry = queue.splice(idx, 1)[0];
+// mu-007: scan both the global queue and (if userId is given) the
+// per-user queue. Returns true if either bucket had the waiter.
+function cancelQueueWait(jobId, reason = 'cancelled', userId = null) {
+  let entry = null;
+  let fromQueue = null;
+  const gi = queue.findIndex(e => e.jobId === jobId);
+  if (gi !== -1) {
+    entry = queue.splice(gi, 1)[0];
+    fromQueue = 'global';
+  } else if (userId) {
+    const slot = userSlots.get(userId);
+    if (slot) {
+      const ui = slot.queued.findIndex(e => e.jobId === jobId);
+      if (ui !== -1) {
+        entry = slot.queued.splice(ui, 1)[0];
+        fromQueue = 'user';
+      }
+    }
+  }
+  if (!entry) return false;
   if (entry.timer) clearTimeout(entry.timer);
   const e = new Error('queue wait cancelled: ' + reason);
   e.queueReason = reason;
@@ -586,10 +678,17 @@ function cancelQueueWait(jobId, reason = 'cancelled') {
   return true;
 }
 function queueStats() {
+  // mu-007: add the additive `userQueued` field so /healthz can show how
+  // many per-user waiters are parked. Existing fields (active, queued,
+  // maxConcurrent, maxQueue, maxQueueWaitMs) keep their shape + order.
+  let userQueued = 0;
+  for (const slot of userSlots.values()) userQueued += slot.queued.length;
   return {
     active: activeCount,
     queued: queue.length,
+    userQueued,
     maxConcurrent: MAX_CONCURRENT_CODEX,
+    maxConcurrentPerUser: MAX_CONCURRENT_PER_USER,
     maxQueue: MAX_QUEUE_SIZE,
     maxQueueWaitMs: MAX_QUEUE_WAIT_MS,
   };
@@ -1767,14 +1866,15 @@ async function handleRunAsync(req, res) {
   });
   gcJob(job);
 
-  // ISSUE-013: acquire a concurrency slot. If the semaphore is full, the
-  // request joins the FIFO queue (or is rejected with 503 queue_full if the
-  // queue itself is at MAX_QUEUE_SIZE). Queue entries that wait longer than
-  // MAX_QUEUE_WAIT_MS are rejected with 503 queue_timeout.
-  const acquire = tryAcquireSlot();
+  // ISSUE-013 + mu-007: acquire a two-layer concurrency slot. If the
+  // global semaphore is full → global FIFO queue. If only this user's
+  // per-user slot is full → per-user FIFO queue. Either queue at
+  // MAX_QUEUE_SIZE rejects with 503 queue_full. Either queue, after
+  // MAX_QUEUE_WAIT_MS of waiting, rejects with 503 queue_timeout.
+  const acquire = tryAcquireSlot({ userId: req.user && req.user.id, isSystem: !!(req.user && req.user.isSystem) });
   if (!acquire.acquired && acquire.mode === 'rejected') {
     res.setHeader('Retry-After', '10');
-    return json(res, 503, { ok: false, error: 'queue_full', queue: queueStats() });
+    return json(res, 503, { ok: false, error: 'queue_full', scope: acquire.scope, queue: queueStats() });
   }
   const startedQueued = acquire.mode === 'queued';
   if (startedQueued) job.state = 'queued';
@@ -1794,18 +1894,30 @@ async function handleRunAsync(req, res) {
   })).catch(e => slog('error', '[codexJobs insert outer] ' + e.message, { jobId: job.id, source: 'codexJobs-insert-outer' }));
 
   if (startedQueued) {
-    const pos = queue.length + 1;
-    emitJob(job, 'queued', { position: pos, maxConcurrent: MAX_CONCURRENT_CODEX, maxQueue: MAX_QUEUE_SIZE, maxQueueWaitMs: MAX_QUEUE_WAIT_MS });
+    // mu-007: queuePosition reflects whichever FIFO we joined. We compute
+    // it BEFORE we hand control to waitForSlot, because the queue length
+    // can shift between tryAcquireSlot() and now (another queued req
+    // can land first).
+    const queueScope = acquire.scope;   // 'global' | 'user'
+    const pos = queueScope === 'user'
+      ? ((userSlots.get(req.user && req.user.id) || { queued: [] }).queued.length + 1)
+      : (queue.length + 1);
+    emitJob(job, 'queued', {
+      position: pos, scope: queueScope,
+      maxConcurrent: MAX_CONCURRENT_CODEX,
+      maxConcurrentPerUser: MAX_CONCURRENT_PER_USER,
+      maxQueue: MAX_QUEUE_SIZE, maxQueueWaitMs: MAX_QUEUE_WAIT_MS,
+    });
     json(res, 202, {
       ok: true, async: true, jobId: job.id,
-      state: 'queued', queuePosition: pos,
+      state: 'queued', queuePosition: pos, queueScope,
       statusUrl: '/job/' + job.id,
       eventsUrl: '/job/' + job.id + '/events',
       timeoutSec: timeoutS,
     });
     let grant;
     try {
-      grant = await waitForSlot({ jobId: job.id });
+      grant = await waitForSlot({ jobId: job.id, userId: req.user && req.user.id, isSystem: !!(req.user && req.user.isSystem), scope: queueScope });
     } catch (e) {
       await killJobTree(null, { jobId: job.id, reason: 'queue_timeout' });
       job.state = 'error';
@@ -1834,7 +1946,7 @@ async function handleRunAsync(req, res) {
     job.error = String(e && e.message || e);
     job.finished = Date.now();
     emitJob(job, 'error', { error: job.error });
-    releaseSlot();
+    releaseSlot({ userId: req.user && req.user.id, isSystem: !!(req.user && req.user.isSystem) });
     return json(res, 500, { ok: false, jobId: job.id, error: job.error });
   }
   job.runId = spawn.runId;
@@ -2066,9 +2178,11 @@ async function handleRunAsync(req, res) {
       statusCode: job.ok ? 200 : (job.killed ? 504 : 502),
       ok: !!job.ok, quotaExceeded: !!job.quotaExceeded,
     });
-    // ISSUE-013: free the concurrency slot; this drains the queue and grants
-    // the next FIFO waiter their slot (activeCount--, then drainQueue()).
-    releaseSlot();
+    // ISSUE-013 + mu-007: free the two-layer concurrency slot; this
+    // drains the per-user FIFO first (the slot that just freed was the
+    // releaser's, so a per-user waiter is the natural next grant), then
+    // drains the global FIFO.
+    releaseSlot({ userId: req.user && req.user.id, isSystem: !!(req.user && req.user.isSystem) });
   });
 
   spawn.child.on('error', (e) => {
@@ -2094,8 +2208,8 @@ async function handleRunAsync(req, res) {
       jobId: job.id, runId: spawn.runId, route: '/run-async',
       ok: false, error: job.error || 'spawn_error',
     });
-    // ISSUE-013: free the concurrency slot.
-    releaseSlot();
+    // ISSUE-013 + mu-007: free the two-layer concurrency slot.
+    releaseSlot({ userId: req.user && req.user.id, isSystem: !!(req.user && req.user.isSystem) });
   });
 }
 
@@ -2530,13 +2644,15 @@ const server = http.createServer(async (req, res) => {
     if (!pgPool) return json(res, 200, { ok: true, rows: [], note: 'no db configured' });
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 200);
     try {
+      const userId = (req.user && req.user.id) || 'system';
       const r = await pgPool.query(
         `SELECT run_id, prompt, model, exit_code, duration_ms, ok, created_at,
                 LEFT(stdout, 800)  AS stdout_preview,
                 LEFT(stderr, 400)  AS stderr_preview
            FROM codex_runs
-           ORDER BY created_at DESC
-           LIMIT $1`, [limit]
+          WHERE (user_id = $2 OR $2 = 'system')
+          ORDER BY created_at DESC
+          LIMIT $1`, [limit, userId]
       );
       return json(res, 200, { ok: true, rows: r.rows });
     } catch (e) {
@@ -2548,8 +2664,12 @@ const server = http.createServer(async (req, res) => {
     if (!pgPool) return json(res, 404, { ok: false, error: 'no db' });
     const runId = url.pathname.slice('/history/'.length);
     try {
-      const r = await pgPool.query(`SELECT * FROM codex_runs WHERE run_id = $1`, [runId]);
-      if (!r.rows.length) return json(res, 404, { ok: false, error: 'not found' });
+      const userId = (req.user && req.user.id) || 'system';
+      const r = await pgPool.query(
+        `SELECT * FROM codex_runs WHERE run_id = $1 AND (user_id = $2 OR $2 = 'system')`,
+        [runId, userId]
+      );
+      if (!r.rows.length) return json(res, 404, { ok: false, error: 'not_found' });
       return json(res, 200, { ok: true, row: r.rows[0] });
     } catch (e) { return json(res, 500, { ok: false, error: e.message }); }
   }
