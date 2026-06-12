@@ -964,9 +964,22 @@ function sanitizePdfError(err, kind) {
     return 'PDF 技能未产出文件。可能是输入格式不被支持或源页面脚本渲染失败。';
   }
   if (/exited\s+\d+/i.test(msg)) {
-    return 'PDF 技能内部失败(详细日志已记录到服务端)。';
+    return 'PDF 技能内部失败(完整 stderr 已附在 stderr_tail 字段)。';
   }
-  return 'PDF 生成失败(详细日志已记录到服务端)。';
+  return 'PDF 生成失败(完整 stderr 已附在 stderr_tail 字段)。';
+}
+
+// Pull the stderr portion from a runPdfScript error. runPdfScript formats
+// its errors as 'skill exited N — stderr: <tail>' or 'PDF not produced at
+// <path> — meta: <tail>'. Return the last 1500 bytes of stderr so the
+// client can show it back to the user. If we can't find a tail, return
+// the raw error message.
+function extractStderrTail(err) {
+  const msg = String(err && err.message || err || '');
+  // 'skill exited N — stderr: <tail>' or 'PDF not produced at <path> — meta: <tail>'
+  const m = msg.match(/(?:stderr|meta):\s*([\s\S]+?)$/);
+  if (m) return String(m[1] || '').slice(-1500);
+  return msg.slice(-1500);
 }
 
 async function runPdfScript(inputPath, slug) {
@@ -1039,7 +1052,7 @@ async function handlePdfUrl(req, res) {
     });
     return res.end(pdf);
   } catch (e) {
-    return json(res, 500, { ok: false, error: sanitizePdfError(e, 'url') });
+    return json(res, 500, { ok: false, error: sanitizePdfError(e, 'url'), stderr_tail: extractStderrTail(e) });
   }
 }
 
@@ -1098,7 +1111,7 @@ async function handlePdfUpload(req, res) {
     });
     return res.end(pdf);
   } catch (e) {
-    return json(res, 500, { ok: false, error: sanitizePdfError(e, 'upload') });
+    return json(res, 500, { ok: false, error: sanitizePdfError(e, 'upload'), stderr_tail: extractStderrTail(e) });
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}
   }

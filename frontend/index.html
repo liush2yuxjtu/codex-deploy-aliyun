@@ -641,6 +641,21 @@ function appendTurn(t) {
       if (t.error) {
         bubble.innerHTML += `<div style="color:var(--danger);font-weight:500;">⚠ ${escapeHtml(t.error)}</div>`;
       }
+      // PDF-specific: surface the script's stderr (last 1500 bytes) so
+      // the user can see what actually failed inside the skill, not just
+      // the one-line sanitized error. Always-visible <pre> with a label
+      // follows the chat-UX pattern from bff3161 — never collapse.
+      if (t.stderrTail) {
+        const label = document.createElement('div');
+        label.style.cssText = 'margin-top:8px;font-size:11px;opacity:.7;letter-spacing:.5px;text-transform:uppercase;color:var(--text-dim);';
+        label.textContent = 'PDF STDERR · ' + t.stderrTail.length + ' 字符';
+        bubble.appendChild(label);
+        const pre = document.createElement('pre');
+        pre.className = 'code stderr';
+        pre.style.cssText = 'margin-top:4px;white-space:pre-wrap;word-break:break-all;';
+        pre.textContent = t.stderrTail;
+        bubble.appendChild(pre);
+      }
       // ISSUE-012: collapsible "看 raw output" tail panel for async jobs.
       // Default collapsed; toggles via the toggle button. Re-render is cheap
       // because the panel only owns its own <pre> + overflow note.
@@ -1016,8 +1031,8 @@ async function submitPdfUrl() {
     input.value = '';
     setPdfStatus('PDF 已生成');
   } catch (e) {
-    Object.assign(assistantTurn, { pending: false, ok: false, error: String(e.message || e) });
-    setPdfStatus(String(e.message || e), true);
+    Object.assign(assistantTurn, { pending: false, ok: false, error: String(e.message || e), stderrTail: e.stderrTail || '' });
+    setPdfStatus(String(e.message || e) + (e.stderrTail ? ' (stderr 详见对话气泡)' : ''), true);
   } finally {
     togglePdfUrl();
     saveConvos();
@@ -1048,8 +1063,8 @@ async function submitPdfFile(file) {
     Object.assign(assistantTurn, { pending: false, ok: true, exitCode: 0, pdf });
     setPdfStatus('PDF 已生成');
   } catch (e) {
-    Object.assign(assistantTurn, { pending: false, ok: false, error: String(e.message || e) });
-    setPdfStatus(String(e.message || e), true);
+    Object.assign(assistantTurn, { pending: false, ok: false, error: String(e.message || e), stderrTail: e.stderrTail || '' });
+    setPdfStatus(String(e.message || e) + (e.stderrTail ? ' (stderr 详见对话气泡)' : ''), true);
   } finally {
     saveConvos();
     renderChat();
@@ -1059,6 +1074,21 @@ async function submitPdfFile(file) {
 async function parsePdfResponse(response, source) {
   if (!response.ok) {
     const text = await response.text().catch(() => '');
+    // Try to surface server-side stderr_tail so the user can see what
+    // the PDF skill actually wrote to its stderr stream, not just the
+    // one-line client-safe message in `error`.
+    let stderrTail = '';
+    try {
+      const j = JSON.parse(text);
+      if (j && j.stderr_tail) stderrTail = String(j.stderr_tail);
+      if (j && j.error) {
+        const e = new Error(j.error);
+        e.stderrTail = stderrTail;
+        throw e;
+      }
+    } catch (e) {
+      if (e instanceof Error && e.stderrTail !== undefined) throw e;
+    }
     throw new Error(text || ('PDF endpoint failed: HTTP ' + response.status));
   }
   const type = response.headers.get('content-type') || '';
@@ -1069,7 +1099,11 @@ async function parsePdfResponse(response, source) {
     return { filename: filenameFromHeaders(response) || 'webfirst.pdf', pdfUrl: currentPdfObjectUrl, downloadUrl: currentPdfObjectUrl, previewUrl: currentPdfObjectUrl, source };
   }
   const payload = await response.json();
-  if (payload.ok === false) throw new Error(payload.error || 'PDF generation failed');
+  if (payload.ok === false) {
+    const e = new Error(payload.error || 'PDF generation failed');
+    e.stderrTail = payload.stderr_tail || '';
+    throw e;
+  }
   const pdf = payload.pdf || payload;
   const dataUrl = pdf.pdfBase64 ? pdfBase64ToObjectUrl(pdf.pdfBase64) : '';
   return {
