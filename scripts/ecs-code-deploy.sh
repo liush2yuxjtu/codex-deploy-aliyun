@@ -115,6 +115,12 @@ if [[ "$SERVER_ONLY" -eq 0 ]]; then
     [[ -f "$f" ]] || continue
     run "$SCP '$f' $SSH_TARGET:$SERVER_DIR/$(basename "$f")"
   done
+  log "drop frontend/index.html → $SERVER_DIR/public/index.html"
+  # The remote serves the chat UI out of /opt/codex-api/public/. Local
+  # source is frontend/index.html (no public/ in the repo). Mirror it.
+  # Without this step, frontend changes never reach the deployed page.
+  run "$SSH \"mkdir -p $SERVER_DIR/public\""
+  run "$SCP $REPO_DIR/frontend/index.html $SSH_TARGET:$SERVER_DIR/public/index.html"
 fi
 
 if [[ "$MIGRATIONS_ONLY" -eq 0 ]]; then
