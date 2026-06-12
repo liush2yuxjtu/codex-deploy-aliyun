@@ -14,9 +14,15 @@ effort: small
 expected_commits: 1
 ready_for_agent: false
 status: done
-option_chosen: C
-merged_commit: 61a2c03
+option_chosen: B
+merged_commit: f15fa6b
 closed_at: 2026-06-12
+note: |
+  Race with 61a2c03(option C, gitignore whole fixtures/ dir) — both
+  patterns now coexist in .gitignore, B's literal `workspace/fixtures/
+  anonymized.html` is a no-op on top of C's `workspace/fixtures/`.
+  User explicit "B please" in fork directive supersedes the earlier
+  C landing.
 ---
 
 # ISSUE-008: workspace/anonymized.html 处置(A/B/C 选项)
