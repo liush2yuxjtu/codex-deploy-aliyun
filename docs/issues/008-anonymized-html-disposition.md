@@ -7,13 +7,16 @@ type: HITL
 blocked_by: []
 soft_blocked_by: []
 files:
-  - workspace/anonymized.html
+  - workspace/fixtures/
   - .gitignore
 risk: low
 effort: small
 expected_commits: 1
 ready_for_agent: false
-status: pending
+status: done
+option_chosen: C
+merged_commit: 61a2c03
+closed_at: 2026-06-12
 ---
 
 # ISSUE-008: workspace/anonymized.html 处置(A/B/C 选项)
