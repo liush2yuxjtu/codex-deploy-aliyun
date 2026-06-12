@@ -61,3 +61,23 @@ unless the user reopens the decision.
   "rotate RDS to VPC intranet". If the user reopens the decision, see
   the `project-rds-security-alert` memory file for the original A/B/C
   options and the trade-off table.
+
+### Credential rotation (LLM OAuth token, RDS password, AccessKey, SSH key)
+
+- **Risk**: The LLM OAuth token, RDS password, Aliyun AccessKey, and
+  SSH private key have all been referenced by path (in chat, in handoff
+  docs, in memory files) over the lifetime of this project. The values
+  were never pasted into chat, but the path-and-metadata exposure
+  pattern is the kind of thing a security review would flag.
+- **Decision**: **Not rotated, accepted as-is by user direction
+  (2026-06-12).** The user judges the current credentials to be safe
+  to keep using. The rotation script (`scripts/rotate_credentials.sh`,
+  ships with `--dry-run` as default) remains in the repo as a
+  reference and as a tool the user can invoke later if they change
+  their mind.
+- **What to do when this comes up**: do not propose running the
+  rotation script, do not nag about the path-and-metadata exposure,
+  do not write reminders. If the user reopens the decision, the
+  prerequisite is filling `LLM_OAUTH_REFRESH_URL` and
+  `LLM_OAUTH_REFRESH_TOKEN` in `~/.claude/skills/aliyun-start/.env`
+  (currently placeholder) before `--only llm --apply` can succeed.
