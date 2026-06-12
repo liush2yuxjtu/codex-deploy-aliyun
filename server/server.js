@@ -921,8 +921,12 @@ function pdfSlug(input) {
     .replace(/[^A-Za-z0-9._-]+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '')
-    .slice(0, 80) || 'doc';
-  return base;
+    .slice(0, 60) || 'doc';
+  // Per-invocation random suffix: two submissions with the same input
+  // (e.g. https://example.com/) used to silently overwrite each other
+  // in the shared /tmp/codex-pdf-out/ output dir. 8 hex chars (crypto
+  // is already required at the top of the file).
+  return base + '-' + crypto.randomBytes(4).toString('hex');
 }
 
 function parseMultipart(req, boundary) {
