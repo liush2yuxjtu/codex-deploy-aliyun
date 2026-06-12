@@ -14,7 +14,9 @@ risk: medium
 effort: medium
 expected_commits: 3
 ready_for_agent: true
-status: pending
+status: done
+merged_commit: ab16c95
+closed_at: 2026-06-12
 ---
 
 # ISSUE-022: OSS PDF bucket + presigned URL 落点
