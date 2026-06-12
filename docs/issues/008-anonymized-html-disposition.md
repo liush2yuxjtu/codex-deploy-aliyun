@@ -12,7 +12,7 @@ files:
 risk: low
 effort: small
 expected_commits: 1
-ready_for_agent: false
+ready_for_agent: true
 status: done
 option_chosen: B
 merged_commit: f15fa6b
