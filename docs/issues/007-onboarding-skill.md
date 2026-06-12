@@ -12,7 +12,9 @@ risk: low
 effort: medium
 expected_commits: 1
 ready_for_agent: true
-status: pending
+status: done
+closed_at: 2026-06-12
+merged_commit: pending
 ---
 
 # ISSUE-007: `onboard-codex-deploy` skill

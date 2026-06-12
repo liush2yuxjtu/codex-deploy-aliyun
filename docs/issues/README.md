@@ -123,6 +123,7 @@ graph TD
 - ISSUE-012 异步任务 chat tail 日志流(e04f0fa) — 2026-06-12 — agent: codex
 - ISSUE-013 并发信号量 + FIFO 队列(e3b3eb2) — 2026-06-12 — agent: codex
 - ISSUE-022 OSS PDF bucket + presigned URL(ab16c95) — 2026-06-12 — agent: codex
+- ISSUE-007 onboard-codex-deploy skill(skills 仓) — 2026-06-12 — agent: codex
 
 ## v3 增量(2026-06-12 fork 拍板,从 aliyun-start 5 个候选挑出)
 
