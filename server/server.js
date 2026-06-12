@@ -119,8 +119,8 @@ async function recordRun(row) {
       // migration hasn't run yet the INSERT will fail and the catch logs
       // the error — we never break the user-facing /run response on
       // persistence failure.
-      `INSERT INTO codex_runs(run_id, prompt, model, exit_code, duration_ms, stdout, stderr, ok, error, client_ip, codex_session_id, parent_session_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      `INSERT INTO codex_runs(run_id, prompt, model, exit_code, duration_ms, stdout, stderr, ok, error, client_ip, codex_session_id, parent_session_id, user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [row.runId, row.prompt, row.model, row.exitCode ?? null,
        row.durationMs ?? null,
        (row.stdout || '').slice(0, 200000),
@@ -129,9 +129,41 @@ async function recordRun(row) {
        row.error || null,
        row.clientIp || null,
        row.codexSessionId ?? null,
-       row.parentSessionId ?? null]
+       row.parentSessionId ?? null,
+       // mu-002: user_id is threaded in by handleRun / handleRunAsync via
+       // req.user.id (set by mu-001's resolveUser middleware). NULL is the
+       // raw default; the migration's UPDATE backfills any pre-mu-001 rows.
+       row.userId ?? null]
     );
   } catch (e) {
+    // Defensive retry-with-null on a user_id constraint violation — the
+    // column is currently nullable + 'system' sentinel, but if a future
+    // migration tightens it to NOT NULL with FK to users.id, this path
+    // lets /run keep responding even when a stale token references a
+    // since-deleted user.
+    const isUserIdIssue = /user_id/i.test(String(e && e.message || e));
+    if (isUserIdIssue) {
+      try {
+        await pgPool.query(
+          `INSERT INTO codex_runs(run_id, prompt, model, exit_code, duration_ms, stdout, stderr, ok, error, client_ip, codex_session_id, parent_session_id, user_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+          [row.runId, row.prompt, row.model, row.exitCode ?? null,
+           row.durationMs ?? null,
+           (row.stdout || '').slice(0, 200000),
+           (row.stderr || '').slice(0, 40000),
+           !!row.ok,
+           row.error || null,
+           row.clientIp || null,
+           row.codexSessionId ?? null,
+           row.parentSessionId ?? null,
+           null]
+        );
+        slog('warn', '[recordRun] user_id constraint hit, retried with null: ' + e.message, { source: 'recordRun', runId: row.runId });
+        return;
+      } catch (e2) {
+        slog('error', '[recordRun] retry-with-null also failed: ' + e2.message, { source: 'recordRun', runId: row.runId });
+      }
+    }
     slog('error', '[recordRun] insert failed: ' + e.message, { source: 'recordRun' });
   }
 }
@@ -148,8 +180,8 @@ async function insertCodexJob(row) {
       `INSERT INTO codex_jobs
          (job_id, status, prompt, model, started_at, finished_at,
           duration_ms, exit_code, client_ip, last_event_ts,
-          stdout_path, stderr_path)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          stdout_path, stderr_path, user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        ON CONFLICT (job_id) DO NOTHING`,
       [
         row.jobId, row.status, row.prompt, row.model ?? null,
@@ -157,6 +189,7 @@ async function insertCodexJob(row) {
         row.durationMs ?? null, row.exitCode ?? null,
         row.clientIp ?? null, row.lastEventTs,
         row.stdoutPath, row.stderrPath,
+        row.userId ?? null,
       ]
     );
   } catch (e) {
@@ -951,40 +984,125 @@ function ossPutObject(objectKey, buffer, contentType) {
 
 // Upload a PDF buffer and return { ossKey, downloadUrl, expiresAt, size }.
 // Throws if OSS is not configured or the upload fails.
-async function uploadPdfToOss(buffer, slug) {
+// mu-006: the OSS object key is now namespaced by userId (pdfs/<userId>/<yyyy>/<mm>/<slug>-<ts>.pdf)
+// so different users can render the same slug without colliding on the bucket.
+async function uploadPdfToOss(buffer, slug, { userId } = {}) {
   if (!OSS_ENABLED) throw new Error('oss not configured');
   if (!buffer || !buffer.length) throw new Error('empty pdf buffer');
+  const uid = (userId || 'system').toString();
   const now = new Date();
   const yyyy = String(now.getUTCFullYear());
   const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
   // timestamp suffix to keep unique under parallel calls of the same slug
   const ts = now.getTime().toString(36);
   const safeSlug = (slug || 'doc').toString().replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 60) || 'doc';
-  const objectKey = 'pdfs/' + yyyy + '/' + mm + '/' + safeSlug + '-' + ts + '.pdf';
+  const objectKey = 'pdfs/' + uid + '/' + yyyy + '/' + mm + '/' + safeSlug + '-' + ts + '.pdf';
   await ossPutObject(objectKey, buffer, 'application/pdf');
   const { url } = ossPresignGet(objectKey, OSS_PRESIGN_TTL_SEC);
   const expiresAt = new Date(Date.now() + OSS_PRESIGN_TTL_SEC * 1000).toISOString();
   return { ossKey: objectKey, downloadUrl: url, expiresAt, size: buffer.length };
 }
 
-// In-memory cache of slug → most-recent presigned URL. Lets GET /pdf/oss/:slug
-// hand the same client a fresh presign after the original expired (within the
-// retention window). The cache evicts itself on a 60s rolling basis.
-const OSS_URL_CACHE = new Map();   // slug → { ossKey, downloadUrl, expiresAt, size, cachedAt }
+// mu-006: per-user cache. The map shape is userId → slug → entry, so two
+// users rendering the same slug get separate cache entries (and the lookup
+// /pdf/oss/:slug handler is naturally owner-scoped — see US-3.2).
+// Eviction walks the inner maps; system user is included like any other.
+function ossUrlCacheGet(userId, slug) {
+  const inner = OSS_URL_CACHE.get(userId || 'system');
+  return inner ? inner.get(slug) : undefined;
+}
+function ossUrlCachePut(userId, slug, entry) {
+  const uid = userId || 'system';
+  let inner = OSS_URL_CACHE.get(uid);
+  if (!inner) { inner = new Map(); OSS_URL_CACHE.set(uid, inner); }
+  inner.set(slug, entry);
+}
+
+// In-memory cache of userId → slug → { ossKey, downloadUrl, expiresAt, size, cachedAt }.
+// Lets GET /pdf/oss/:slug hand the same client a fresh presign after the original
+// expired (within the retention window). The cache evicts itself on a 60s rolling basis.
+const OSS_URL_CACHE = new Map();   // userId → Map<slug, entry>
 const OSS_URL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;  // 6h — well past 1h presign so refresh works
 setInterval(() => {
   const cutoff = Date.now() - OSS_URL_CACHE_TTL_MS;
-  for (const [k, v] of OSS_URL_CACHE) if (v.cachedAt < cutoff) OSS_URL_CACHE.delete(k);
+  for (const [uid, inner] of OSS_URL_CACHE) {
+    if (!(inner instanceof Map)) { OSS_URL_CACHE.delete(uid); continue; }
+    for (const [k, v] of inner) if (v.cachedAt < cutoff) inner.delete(k);
+    if (inner.size === 0) OSS_URL_CACHE.delete(uid);
+  }
 }, 60 * 1000).unref?.();
+
+// mu-006: recordPdfJob — best-effort INSERT into pdf_jobs on every successful
+// PDF render. Mirrors recordRun's "log-on-failure" contract so a DB outage
+// never breaks the /pdf response. ON CONFLICT (pdf_slug) DO UPDATE bumps
+// last_seen for retry hits of the same slug from the same user.
+async function recordPdfJob(row) {
+  if (!pgPool) return;
+  try {
+    await pgPool.query(
+      `INSERT INTO pdf_jobs (pdf_slug, user_id, kind, source, oss_key, size_bytes, created_at, last_seen)
+       VALUES ($1,$2,$3,$4,$5,$6, now(), now())
+       ON CONFLICT (pdf_slug) DO UPDATE
+         SET last_seen = now(),
+             oss_key   = COALESCE(EXCLUDED.oss_key, pdf_jobs.oss_key),
+             size_bytes= COALESCE(EXCLUDED.size_bytes, pdf_jobs.size_bytes),
+             source    = EXCLUDED.source,
+             kind      = EXCLUDED.kind,
+             user_id   = EXCLUDED.user_id`,
+      [
+        row.pdfSlug, row.userId || 'system', row.kind || 'from-url',
+        row.source || '', row.ossKey || null,
+        row.sizeBytes != null ? Number(row.sizeBytes) : null,
+      ]
+    );
+  } catch (e) {
+    slog('warn', '[pdf_jobs] insert failed: ' + (e && e.message || e), { source: 'pdf_jobs' });
+  }
+}
+
+// mu-006: pdf_jobs lookup by (user_id, pdf_slug). Used by handlePdfOss on
+// cache miss to re-presign from the durable row.
+async function loadPdfJobFromRds(pdfSlug, userId) {
+  if (!pgPool) return null;
+  try {
+    const r = await pgPool.query(
+      `SELECT pdf_slug, user_id, kind, source, oss_key, size_bytes,
+              created_at, last_seen
+         FROM pdf_jobs
+        WHERE pdf_slug = $1 AND user_id = $2
+        LIMIT 1`,
+      [pdfSlug, userId || 'system']
+    );
+    return r.rows.length ? r.rows[0] : null;
+  } catch (e) {
+    slog('warn', '[pdf_jobs] select failed: ' + (e && e.message || e), { source: 'pdf_jobs' });
+    return null;
+  }
+}
 
 // ─── /pdf: md/html → PDF via md-to-pdf-webfirst skill ───
 const PDF_SKILL_DIR  = process.env.PDF_SKILL_DIR
   || path.join(os.homedir(), '.codex', 'skills', 'md-to-pdf-webfirst');
 const PDF_SCRIPT     = path.join(PDF_SKILL_DIR, 'scripts', 'md_to_pdf_webfirst.py');
-const PDF_OUTPUT_DIR = process.env.PDF_OUTPUT_DIR
+// mu-006: PDF_OUTPUT_DIR / PDF_TMP_DIR are now per-user subdirs of the base
+// directory. The base stays a single module-level constant for boot-time
+// backfill walking (see backfillLegacyPdfOutputs() below).
+const PDF_OUTPUT_BASE = process.env.PDF_OUTPUT_DIR
   || path.join(os.tmpdir(), 'codex-pdf-out');
-const PDF_TMP_DIR    = path.join(os.tmpdir(), 'codex-pdf-up');
-const PDF_TIMEOUT_MS = 180 * 1000; // 3 min for a full skill run
+const PDF_TMP_BASE    = path.join(os.tmpdir(), 'codex-pdf-up');
+const PDF_TIMEOUT_MS  = 180 * 1000; // 3 min for a full skill run
+
+// Per-user output dir: <base>/<userId>/ — userId is a TEXT (cdx_… or 'system').
+// Slash in userId is rejected to avoid directory traversal; caller side already
+// validates the id shape (see users.js ID_PREFIX = 'cdx_').
+function pdfOutDir(userId) {
+  const uid = (userId || 'system').toString();
+  return path.join(PDF_OUTPUT_BASE, uid);
+}
+function pdfTmpDir(userId) {
+  const uid = (userId || 'system').toString();
+  return path.join(PDF_TMP_BASE, uid);
+}
 
 function pdfSlug(input) {
   const base = (input || 'doc').toString()
@@ -1069,10 +1187,14 @@ function extractStderrTail(err) {
   return msg.slice(-1500);
 }
 
-async function runPdfScript(inputPath, slug, { onProgress } = {}) {
-  fs.mkdirSync(PDF_OUTPUT_DIR, { recursive: true });
+// mu-006: userId drives the per-user output dir + the pdf_jobs row that
+// recordPdfJob() writes at the end. All callers from handlePdfUrl /
+// handlePdfUpload pass req.user.id (which is 'system' for SHARED_SECRET hits).
+async function runPdfScript(inputPath, slug, { onProgress, userId } = {}) {
+  const outDir = pdfOutDir(userId);
+  fs.mkdirSync(outDir, { recursive: true });
   const cwd = path.dirname(PDF_SCRIPT);
-  const args = [PDF_SCRIPT, '--input', inputPath, '--slug', slug, '--out-dir', PDF_OUTPUT_DIR];
+  const args = [PDF_SCRIPT, '--input', inputPath, '--slug', slug, '--out-dir', outDir];
   console.log('[pdf] exec:', PDF_SCRIPT, 'cwd=', cwd, 'args=', args);
   return await new Promise((resolve, reject) => {
     const t0 = Date.now();
@@ -1092,7 +1214,7 @@ async function runPdfScript(inputPath, slug, { onProgress } = {}) {
     child.on('error', e => { clearTimeout(killer); reject(e); });
     child.on('close', code => {
       clearTimeout(killer);
-      const pdfPath = path.join(PDF_OUTPUT_DIR, slug + '.pdf');
+      const pdfPath = path.join(outDir, slug + '.pdf');
       if (code !== 0) return reject(new Error('skill exited ' + code + ' — stderr: ' + err.slice(-1500)));
       if (!fs.existsSync(pdfPath)) return reject(new Error('PDF not produced at ' + pdfPath + ' — meta: ' + out.slice(-1500)));
       resolve({ pdfPath, ms: Date.now() - t0 });
@@ -1151,6 +1273,9 @@ async function handlePdfUrl(req, res) {
   const wantAsync = String(req.headers['x-pdf-async'] || new URL(req.url, 'http://x').searchParams.get('async') || '') === '1';
   // ─── async path: enqueue + return 202 + jobId, frontend streams
   //     'pdf-line' / 'pdf-done' / 'pdf-error' via /pdf/job/:id/events.
+  // mu-006: owner scope. req.user is set by resolveUser() at the top of
+  // the pipeline (always present; falls back to id='system' for SHARED_SECRET).
+  const userId = (req.user && req.user.id) || 'system';
   if (wantAsync) {
     const job = enqueuePdfJob({
       kind: 'from-url',
@@ -1166,17 +1291,18 @@ async function handlePdfUrl(req, res) {
             emitJob(j, 'pdf-line', { stream, line });
           }
         };
-        const { pdfPath, ms } = await runPdfScript(url, slug, { onProgress });
+        const { pdfPath, ms } = await runPdfScript(url, slug, { onProgress, userId });
         const pdf = fs.readFileSync(pdfPath);
         let oss = null;
         if (OSS_ENABLED) {
           try {
-            oss = await uploadPdfToOss(pdf, slug);
-            OSS_URL_CACHE.set(slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
+            oss = await uploadPdfToOss(pdf, slug, { userId });
+            ossUrlCachePut(userId, slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
           } catch (e) {
             console.error('[pdf:from-url async] oss upload failed:', e && e.message || e);
           }
         }
+        await recordPdfJob({ pdfSlug: slug, userId, kind: 'from-url', source: url, ossKey: oss && oss.ossKey, sizeBytes: pdf.length });
         return { pdfPath, ms, oss };
       },
     });
@@ -1501,6 +1627,9 @@ async function handleRun(req, res) {
       clientIp,
       codexSessionId: codexSessionId || null,
       parentSessionId: requestedSessionId,
+      // mu-002: thread req.user.id (set by mu-001's resolveUser)
+      // into codex_runs.user_id for the future /history filter.
+      userId: (req.user && req.user.id) || null,
     })).catch(e => slog('error', '[recordRun outer] ' + e.message, { runId, source: 'recordRun-outer' }));
   });
 
@@ -1576,6 +1705,7 @@ async function handleRunAsync(req, res) {
     stdoutPath: placeholderStdout,
     stderrPath: placeholderStderr,
     clientIp,
+    userId: (req.user && req.user.id) || null,
   })).catch(e => slog('error', '[codexJobs insert outer] ' + e.message, { jobId: job.id, source: 'codexJobs-insert-outer' }));
 
   if (startedQueued) {
@@ -1614,7 +1744,6 @@ async function handleRunAsync(req, res) {
 
   let spawn;
   try {
-    spawn = startCodexJob({ prompt: effectivePrompt, effectiveKey, effectiveModel, timeoutS, clientIp, sessionId });
   } catch (e) {
     job.state = 'error';
     job.error = String(e && e.message || e);
@@ -1838,9 +1967,11 @@ async function handleRunAsync(req, res) {
       exitCode: job.exitCode, durationMs,
       stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
       ok: !!job.ok, error: job.error || null,
-      clientIp,
       codexSessionId: codexSessionId || null,
       parentSessionId: requestedSessionId,
+      // mu-002: thread req.user.id (set by mu-001's resolveUser)
+      // into codex_runs.user_id for the future /history filter.
+      userId: (req.user && req.user.id) || null,
     })).catch(e => slog('error', '[recordRun async] ' + e.message, { jobId: job.id, runId: spawn.runId, source: 'recordRun-async' }));
     // ISSUE-024: ship a terminal "job done" line so the SLS dashboard
     // can show P50/P95 durationMs + quotaExceeded rate.
