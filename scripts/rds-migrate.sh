@@ -62,7 +62,7 @@ psql_run() {
   if [[ "$USE_SSH" -eq 1 ]]; then
     ssh -i "$SSH_KEY" "root@$SERVER_IP" PGPASSWORD="$RDS_PASSWORD" psql \
       -h "$RDS_HOST" -p "$RDS_PORT" -U "$RDS_USER" -d "$RDS_DB" \
-      -v ON_ERROR_STOP=1 -A -t -c "$1"
+      -v ON_ERROR_STOP=1 -A -t -c "'$1'"
   else
     PGPASSWORD="$RDS_PASSWORD" psql \
       -h "$RDS_HOST" -p "$RDS_PORT" -U "$RDS_USER" -d "$RDS_DB" \
