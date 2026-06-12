@@ -81,3 +81,32 @@ unless the user reopens the decision.
   prerequisite is filling `LLM_OAUTH_REFRESH_URL` and
   `LLM_OAUTH_REFRESH_TOKEN` in `~/.claude/skills/aliyun-start/.env`
   (currently placeholder) before `--only llm --apply` can succeed.
+
+### SWAS + RDS renewal (demo will die on schedule)
+
+- **Risk**: SWAS `5ed54e0e6c3e4b5ca28c184f2c6eb7de` (cn-shanghai,
+  宝塔 Linux) and RDS PostgreSQL `pgm-bp121x155xld74c2`
+  (cn-hangzhou, HA) are both PrePaid and will expire on schedule:
+  - SWAS: **2026-06-29 16:00 UTC** (17 days from 2026-06-12)
+  - RDS: **2026-07-11 16:00 UTC** (29 days from 2026-06-12)
+  Account balance as of 2026-06-12: ¥59.48 — insufficient for either
+  renewal at the cheapest monthly tier (SWAS ¥70, RDS ¥580).
+  When an instance expires, the SWAS box and the RDS go read-only /
+  unreachable in that order, and the deployed demo at
+  `http://106.14.154.23:3030/` stops responding.
+- **Decision**: **Both will be allowed to expire by user direction
+  (2026-06-12).** User chose not to top up + renew either one. The
+  renewal commands (`aliyun swas-open renew-instance …` /
+  `aliyun rds … --PayType Prepaid --UsedTime 1 …`) are documented in
+  this session's recap (fork `a` / task #34 #35). If the user reopens
+  the decision, the prerequisite is topping up the Aliyun account
+  balance to ≥ ¥650 (covers both monthly renewals).
+- **What to do when this comes up**: do not propose renewing, do not
+  nag about the balance, do not write runbooks for "renew the SWAS"
+  or "renew the RDS". When the demo goes down because the SWAS/RDS
+  expired, do not propose spinning up a new instance, do not propose
+  migrating to a different region, do not propose switching to a
+  Supabase-on-aliyun-rds path. If the user reopens the decision, see
+  the pricing block in the 2026-06-12 session recap (SWAS ¥70/mo or
+  ¥714/yr, RDS ¥580/mo or ¥4176/yr with 6 折 first-renewal discount
+  RuleId 20915438 limited to 1 use).
