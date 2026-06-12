@@ -641,6 +641,24 @@ function appendTurn(t) {
       if (t.error) {
         bubble.innerHTML += `<div style="color:var(--danger);font-weight:500;">⚠ ${escapeHtml(t.error)}</div>`;
       }
+      // PDF-specific: live progress log from the JOBS+SSE stream. Renders
+      // last 200 lines with stream label. Same always-visible style as
+      // the chat-UX STDERR block — never collapse.
+      if (t.progressLines && t.progressLines.length) {
+        const label = document.createElement('div');
+        label.style.cssText = 'margin-top:8px;font-size:11px;opacity:.7;letter-spacing:.5px;text-transform:uppercase;color:var(--text-dim);';
+        const streams = t.progressLines.reduce((acc, l) => { acc[l.stream] = (acc[l.stream] || 0) + 1; return acc; }, {});
+        const streamNote = Object.keys(streams).length > 1
+          ? ` (stdout ${streams.stdout || 0} · stderr ${streams.stderr || 0})`
+          : '';
+        label.textContent = `PDF 实时进度 · ${t.progressLines.length} 行${streamNote}`;
+        bubble.appendChild(label);
+        const pre = document.createElement('pre');
+        pre.className = 'code';
+        pre.style.cssText = 'margin-top:4px;white-space:pre-wrap;word-break:break-all;max-height:240px;overflow:auto;font-size:12px;';
+        pre.textContent = t.progressLines.map(l => l.line).join('\n');
+        bubble.appendChild(pre);
+      }
       // PDF-specific: surface the script's stderr (last 1500 bytes) so
       // the user can see what actually failed inside the skill, not just
       // the one-line sanitized error. Always-visible <pre> with a label
@@ -1021,11 +1039,22 @@ async function submitPdfUrl() {
   setPdfStatus('正在生成 PDF…');
   document.getElementById('pdf-url-btn').disabled = true;
   try {
-    const r = await fetch(endpointPath('/pdf/from-url'), {
+    const r = await fetch(endpointPath('/pdf/from-url?async=1'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ url: sourceUrl, mode: 'webfirst' }),
     });
+    // If the server returned 202 + jobId, switch to EventSource so the
+    // user sees stdout progress (no more 5-180s blackout). If the server
+    // is on the v1 sync path (non-202), fall through to parsePdfResponse.
+    if (r.status === 202) {
+      const j = await r.json();
+      if (j && j.jobId) {
+        input.value = '';
+        await subscribePdfJob(j.jobId, assistantTurn);
+        return;
+      }
+    }
     const pdf = await parsePdfResponse(r, sourceUrl);
     Object.assign(assistantTurn, { pending: false, ok: true, exitCode: 0, pdf });
     input.value = '';
@@ -1058,7 +1087,14 @@ async function submitPdfFile(file) {
     const body = new FormData();
     body.append('file', file, file.name);
     body.append('mode', 'webfirst');
-    const r = await fetch(endpointPath('/pdf/from-file'), { method: 'POST', body });
+    const r = await fetch(endpointPath('/pdf/from-file?async=1'), { method: 'POST', body });
+    if (r.status === 202) {
+      const j = await r.json();
+      if (j && j.jobId) {
+        await subscribePdfJob(j.jobId, assistantTurn);
+        return;
+      }
+    }
     const pdf = await parsePdfResponse(r, file.name);
     Object.assign(assistantTurn, { pending: false, ok: true, exitCode: 0, pdf });
     setPdfStatus('PDF 已生成');
@@ -1069,6 +1105,82 @@ async function submitPdfFile(file) {
     saveConvos();
     renderChat();
   }
+}
+
+// Subscribe to a PDF job's SSE stream and update the assistant turn as
+// events arrive. On 'pdf-line' we append to a rolling stdout/stderr
+// tail on the turn; on 'pdf-done' we finalize the turn with the
+// downloadUrl; on 'pdf-error' we finalize with the error + stderr_tail.
+function subscribePdfJob(jobId, assistantTurn) {
+  return new Promise((resolve) => {
+    const url = endpointPath('/job/' + jobId + '/events');
+    const es = new EventSource(url);
+    assistantTurn.progressLines = [];
+    const flush = () => { saveConvos(); renderChat(); };
+    setPdfStatus('已派发 PDF 任务 #' + jobId.slice(0, 8) + '…');
+    es.addEventListener('snapshot', (e) => {
+      // initial state — nothing to render yet, just show "queued"
+    });
+    es.addEventListener('pdf-start', () => {
+      setPdfStatus('PDF 任务已启动…');
+      flush();
+    });
+    es.addEventListener('pdf-line', (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        assistantTurn.progressLines.push({ stream: d.stream, line: d.line, ts: Date.now() });
+        // cap to last 200 lines so a runaway script doesn't bloat the DOM
+        if (assistantTurn.progressLines.length > 200) assistantTurn.progressLines.shift();
+        // status line shows the last useful line (truncated)
+        const last = String(d.line || '').slice(0, 80);
+        if (last) setPdfStatus('… ' + last);
+        flush();
+      } catch {}
+    });
+    es.addEventListener('pdf-done', (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        const downloadUrl = d.oss && d.oss.downloadUrl ? d.oss.downloadUrl : (d.fileUrl || '');
+        const pdf = {
+          filename: (d.slug || 'webfirst') + '.pdf',
+          pdfUrl: downloadUrl,
+          downloadUrl: downloadUrl,
+          previewUrl: downloadUrl,
+          jobId: d.id || jobId,
+          size: d.oss && d.oss.size,
+          pageCount: d.pages,
+          source: assistantTurn.pdfSource || '',
+        };
+        Object.assign(assistantTurn, { pending: false, ok: true, exitCode: 0, pdf });
+        setPdfStatus('PDF 已生成');
+        flush();
+      } catch (err) { /* ignore */ }
+      try { es.close(); } catch {}
+      resolve();
+    });
+    es.addEventListener('pdf-error', (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        Object.assign(assistantTurn, {
+          pending: false, ok: false,
+          error: d.error || 'PDF 生成失败',
+          stderrTail: d.stderr_tail || '',
+        });
+        setPdfStatus(String(d.error || 'PDF 生成失败') + (d.stderr_tail ? ' (stderr 详见对话气泡)' : ''), true);
+        flush();
+      } catch (err) { /* ignore */ }
+      try { es.close(); } catch {}
+      resolve();
+    });
+    es.onerror = () => {
+      // The server closes the stream after pdf-done / pdf-error; if it
+      // errors out unexpectedly, surface that and resolve so the caller
+      // doesn't hang.
+      setPdfStatus('PDF 任务连接中断', true);
+      try { es.close(); } catch {}
+      resolve();
+    };
+  });
 }
 
 async function parsePdfResponse(response, source) {

@@ -982,7 +982,7 @@ function extractStderrTail(err) {
   return msg.slice(-1500);
 }
 
-async function runPdfScript(inputPath, slug) {
+async function runPdfScript(inputPath, slug, { onProgress } = {}) {
   fs.mkdirSync(PDF_OUTPUT_DIR, { recursive: true });
   const cwd = path.dirname(PDF_SCRIPT);
   const args = [PDF_SCRIPT, '--input', inputPath, '--slug', slug, '--out-dir', PDF_OUTPUT_DIR];
@@ -992,8 +992,16 @@ async function runPdfScript(inputPath, slug) {
     const child = spawn(process.env.PDF_PYTHON_BIN || 'python3.11', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
     const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, PDF_TIMEOUT_MS);
-    child.stdout.on('data', c => out += c.toString('utf8'));
-    child.stderr.on('data', c => err += c.toString('utf8'));
+    child.stdout.on('data', c => {
+      const s = c.toString('utf8');
+      out += s;
+      if (onProgress) onProgress('stdout', s);
+    });
+    child.stderr.on('data', c => {
+      const s = c.toString('utf8');
+      err += s;
+      if (onProgress) onProgress('stderr', s);
+    });
     child.on('error', e => { clearTimeout(killer); reject(e); });
     child.on('close', code => {
       clearTimeout(killer);
@@ -1005,6 +1013,46 @@ async function runPdfScript(inputPath, slug) {
   });
 }
 
+// Run a PDF job in the JOBS / SSE framework. The `runner` callback gets
+// the live job object and should call runPdfScript with onProgress that
+// forwards chunks via emitJob(job, ...). Returns 202 + { jobId, ... }.
+// Reuses the existing /job/:id/events endpoint so the frontend can
+// attach via EventSource to stream 'pdf-stdout' / 'pdf-stderr' /
+// 'pdf-done' / 'pdf-error' events back to the assistant turn.
+function enqueuePdfJob({ kind, label, sourcePath, slug, runner }) {
+  const job = makeJob({ kind, label, sourcePath, slug, state: 'pending', started: Date.now() });
+  emitJob(job, 'pdf-start', { kind, slug, sourcePath, label });
+  // Fire and forget. The runner resolves the pdfPath on success; we
+  // emit pdf-done with the OSS URL or fall back to a binary marker.
+  (async () => {
+    try {
+      const result = await runner(job);
+      emitJob(job, 'pdf-done', {
+        ok: true, ms: result.ms, pdfPath: result.pdfPath, slug,
+        oss: result.oss ? {
+          downloadUrl: result.oss.downloadUrl,
+          ossKey: result.oss.ossKey,
+          expiresAt: result.oss.expiresAt,
+          size: result.oss.size,
+        } : null,
+        fileUrl: '/pdf/file/' + slug,
+      });
+      job.state = 'done';
+      job.finished = Date.now();
+      job.ok = true;
+      gcJob(job);
+    } catch (e) {
+      emitJob(job, 'pdf-error', { ok: false, error: sanitizePdfError(e, kind), stderr_tail: extractStderrTail(e) });
+      job.state = 'error';
+      job.finished = Date.now();
+      job.ok = false;
+      job.error = String(e && e.message || e);
+      gcJob(job);
+    }
+  })();
+  return job;
+}
+
 async function handlePdfUrl(req, res) {
   const raw = await readBody(req);
   let body; try { body = JSON.parse(raw || '{}'); } catch { return json(res, 400, { ok: false, error: 'bad json' }); }
@@ -1013,6 +1061,43 @@ async function handlePdfUrl(req, res) {
   if (!/^https?:\/\//.test(url)) return json(res, 400, { ok: false, error: 'url must be http(s)' });
   if (!fs.existsSync(PDF_SCRIPT)) return json(res, 503, { ok: false, error: 'md-to-pdf-webfirst skill not installed at ' + PDF_SKILL_DIR });
   const slug = pdfSlug(body.slug || url);
+  const wantAsync = String(req.headers['x-pdf-async'] || new URL(req.url, 'http://x').searchParams.get('async') || '') === '1';
+  // ─── async path: enqueue + return 202 + jobId, frontend streams
+  //     'pdf-line' / 'pdf-done' / 'pdf-error' via /pdf/job/:id/events.
+  if (wantAsync) {
+    const job = enqueuePdfJob({
+      kind: 'from-url',
+      label: 'PDF: ' + url,
+      sourcePath: url,
+      slug,
+      runner: async (j) => {
+        const onProgress = (stream, chunk) => {
+          const lines = String(chunk).split(/\r?\n/);
+          for (const line of lines) {
+            if (!line) continue;
+            emitJob(j, 'pdf-line', { stream, line });
+          }
+        };
+        const { pdfPath, ms } = await runPdfScript(url, slug, { onProgress });
+        const pdf = fs.readFileSync(pdfPath);
+        let oss = null;
+        if (OSS_ENABLED) {
+          try {
+            oss = await uploadPdfToOss(pdf, slug);
+            OSS_URL_CACHE.set(slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
+          } catch (e) {
+            console.error('[pdf:from-url async] oss upload failed:', e && e.message || e);
+          }
+        }
+        return { pdfPath, ms, oss };
+      },
+    });
+    return json(res, 202, {
+      ok: true, async: true, jobId: job.id, kind: 'from-url', slug,
+      statusUrl: '/job/' + job.id,
+      eventsUrl: '/job/' + job.id + '/events',
+    });
+  }
   try {
     const { pdfPath, ms } = await runPdfScript(url, slug);
     const pdf = fs.readFileSync(pdfPath);
@@ -1081,6 +1166,48 @@ async function handlePdfUpload(req, res) {
   const tmpPath = path.join(PDF_TMP_DIR, Date.now() + '-' + safeName);
   fs.writeFileSync(tmpPath, file.data);
   const slug = pdfSlug(path.basename(safeName, ext));
+  const wantAsync = String(req.headers['x-pdf-async'] || new URL(req.url, 'http://x').searchParams.get('async') || '') === '1';
+  // ─── async path: enqueue + return 202 + jobId, frontend streams
+  //     'pdf-line' / 'pdf-done' / 'pdf-error' via /job/:id/events.
+  if (wantAsync) {
+    const job = enqueuePdfJob({
+      kind: 'from-upload',
+      label: 'PDF: ' + file.filename,
+      sourcePath: tmpPath,
+      slug,
+      runner: async (j) => {
+        try {
+          const onProgress = (stream, chunk) => {
+            const lines = String(chunk).split(/\r?\n/);
+            for (const line of lines) {
+              if (!line) continue;
+              emitJob(j, 'pdf-line', { stream, line });
+            }
+          };
+          const { pdfPath, ms } = await runPdfScript(tmpPath, slug, { onProgress });
+          const pdf = fs.readFileSync(pdfPath);
+          let oss = null;
+          if (OSS_ENABLED) {
+            try {
+              oss = await uploadPdfToOss(pdf, slug);
+              OSS_URL_CACHE.set(slug, { ossKey: oss.ossKey, downloadUrl: oss.downloadUrl, expiresAt: oss.expiresAt, size: oss.size, cachedAt: Date.now() });
+            } catch (e) {
+              console.error('[pdf:from-upload async] oss upload failed:', e && e.message || e);
+            }
+          }
+          return { pdfPath, ms, oss };
+        } finally {
+          // Always clean up the tmp upload, success or failure.
+          try { fs.unlinkSync(tmpPath); } catch {}
+        }
+      },
+    });
+    return json(res, 202, {
+      ok: true, async: true, jobId: job.id, kind: 'from-upload', slug,
+      statusUrl: '/job/' + job.id,
+      eventsUrl: '/job/' + job.id + '/events',
+    });
+  }
   try {
     const { pdfPath, ms } = await runPdfScript(tmpPath, slug);
     const pdf = fs.readFileSync(pdfPath);
@@ -1933,6 +2060,21 @@ const server = http.createServer(async (req, res) => {
     const slug = decodeURIComponent(url.pathname.slice('/pdf/oss/'.length));
     if (!slug || !/^[A-Za-z0-9._-]+$/.test(slug)) return json(res, 400, { ok: false, error: 'bad slug' });
     return handlePdfOss(req, res, slug);
+  }
+  // ─── /pdf/file/:slug — stream the local PDF binary (for async path
+  //     where the client got a jobId + fileUrl, not a streamed body) ───
+  if (req.method === 'GET' && url.pathname.startsWith('/pdf/file/')) {
+    const slug = decodeURIComponent(url.pathname.slice('/pdf/file/'.length));
+    if (!slug || !/^[A-Za-z0-9._-]+$/.test(slug)) return json(res, 400, { ok: false, error: 'bad slug' });
+    const pdfPath = path.join(PDF_OUTPUT_DIR, slug + '.pdf');
+    if (!fs.existsSync(pdfPath)) return json(res, 404, { ok: false, error: 'pdf not found for slug: ' + slug });
+    const pdf = fs.readFileSync(pdfPath);
+    res.writeHead(200, {
+      'Content-Type': 'application/pdf',
+      'Content-Length': pdf.length,
+      'Content-Disposition': 'inline; filename="' + slug + '.pdf"',
+    });
+    return res.end(pdf);
   }
   // ─── static frontend ───
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
