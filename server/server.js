@@ -690,6 +690,17 @@ function checkAuth(req) {
       || (url.searchParams.get('key') || '') === SHARED_SECRET;
 }
 
+// Best-effort client IP. Trusts x-forwarded-for when present (we sit
+// behind a reverse proxy in some deploys), falls back to the socket
+// peer. Returns null when nothing usable — callers must treat null
+// as "unknown" rather than anonymous (see handleJobEvents).
+function reqClientIp(req) {
+  const xff = (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim();
+  if (xff) return xff;
+  const sock = (req.socket && req.socket.remoteAddress) || '';
+  return sock || null;
+}
+
 function json(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
@@ -1019,8 +1030,8 @@ async function runPdfScript(inputPath, slug, { onProgress } = {}) {
 // Reuses the existing /job/:id/events endpoint so the frontend can
 // attach via EventSource to stream 'pdf-stdout' / 'pdf-stderr' /
 // 'pdf-done' / 'pdf-error' events back to the assistant turn.
-function enqueuePdfJob({ kind, label, sourcePath, slug, runner }) {
-  const job = makeJob({ id: newJobId(), kind, label, sourcePath, slug, state: 'pending', started: Date.now() });
+function enqueuePdfJob({ kind, label, sourcePath, slug, runner, clientIp }) {
+  const job = makeJob({ id: newJobId(), kind, label, sourcePath, slug, state: 'pending', started: Date.now(), clientIp });
   emitJob(job, 'pdf-start', { kind, slug, sourcePath, label });
   // Fire and forget. The runner resolves the pdfPath on success; we
   // emit pdf-done with the OSS URL or fall back to a binary marker.
@@ -1070,6 +1081,7 @@ async function handlePdfUrl(req, res) {
       label: 'PDF: ' + url,
       sourcePath: url,
       slug,
+      clientIp: reqClientIp(req),
       runner: async (j) => {
         const onProgress = (stream, chunk) => {
           const lines = String(chunk).split(/\r?\n/);
@@ -1175,6 +1187,7 @@ async function handlePdfUpload(req, res) {
       label: 'PDF: ' + file.filename,
       sourcePath: tmpPath,
       slug,
+      clientIp: reqClientIp(req),
       runner: async (j) => {
         try {
           const onProgress = (stream, chunk) => {
@@ -1894,6 +1907,21 @@ function handleJobEvents(req, res, jobId) {
 
   const job = JOBS.get(jobId);
   if (!job) return json(res, 404, { ok: false, error: 'job not found or expired' });
+
+  // D-route isolation: only the job's creator (matched by client_ip)
+  // can subscribe to its SSE stream. Without this, any leak of a
+  // runId/jobId — e.g. a /history listing that exposes them — lets
+  // third parties attach to someone else's live output.
+  //
+  // Fail-open when job.clientIp is null: legacy jobs from before this
+  // fix had no IP captured, and we don't want to wedge in-flight
+  // streams. New jobs always have clientIp set via reqClientIp.
+  if (job.clientIp) {
+    const reqIp = reqClientIp(req);
+    if (reqIp !== job.clientIp) {
+      return json(res, 403, { ok: false, error: 'forbidden: not the job creator' });
+    }
+  }
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
