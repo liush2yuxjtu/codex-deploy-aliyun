@@ -17,6 +17,12 @@ const path = require('path');
 // (replaces `journalctl -u codex-api.service -f`). stdout stays the
 // primary sink; sls is a best-effort secondary.
 const sls = require('./sls-logger');
+// mu-001: multi-user identity helpers. mint/resolve/revoke/stats/list.
+// The middleware (resolveUser) consumes resolveToken; the admin routes
+// (POST /admin/users etc.) consume the rest. The pgPool injection via
+// globalThis lets the module avoid a hard dependency on the connection
+// pool being initialized in this file.
+const users = require('./users');
 
 const PORT          = parseInt(process.env.PORT || '3030', 10);
 const SHARED_SECRET = process.env.DEMO_SECRET || ''; // empty = no auth
@@ -95,6 +101,13 @@ if (RDS_HOST && RDS_DB && RDS_USER) {
 } else {
   console.log('[codex-api] no RDS_* env — running without history persistence');
 }
+
+// mu-001: bridge pgPool + slog to the users module via globalThis so the
+// module doesn't need to know about server.js's module-private variables.
+// This is intentionally narrow — the module is fully testable in
+// isolation by passing a `{ pgPool, slog }` deps object.
+globalThis.__pgPool = () => pgPool;
+globalThis.__slog = slog;
 
 async function recordRun(row) {
   if (!pgPool) return;
@@ -688,6 +701,65 @@ function checkAuth(req) {
   const url = new URL(req.url, 'http://x');
   return (req.headers['x-demo-key'] || '') === SHARED_SECRET
       || (url.searchParams.get('key') || '') === SHARED_SECRET;
+}
+
+// mu-001: resolveUser(req) → sets req.user = { id, name, isSystem, ... }.
+// Runs after CORS, before route dispatch. Three resolution paths in order:
+//
+//   1) x-demo-key / ?key= matches SHARED_SECRET → system user (id='system')
+//   2) Authorization: Bearer <token> OR X-Codex-User: <token> → resolveToken
+//   3) SHARED_SECRET is empty (v1 demo mode) → system user (preserves v1)
+//
+// Failure: when SHARED_SECRET is set AND no token AND no matching
+// x-demo-key AND no ?key= → 401. The 401 reason is one of:
+//   - 'no_token'     : nothing supplied
+//   - 'token_invalid' : token didn't match any non-revoked user row
+//   - 'token_revoked' : token matched a row whose revoked_at is set
+//
+// The 401 path is only used by the resolveUser-aware admin routes that
+// explicitly call it; pre-existing routes that use checkAuth() continue
+// to behave as before (the resolveUser outcome is stashed on req.user,
+// and the existing checkAuth() guard still gates them).
+async function resolveUser(req) {
+  const url = new URL(req.url, 'http://x');
+  const demoKey = (req.headers['x-demo-key'] || '').toString();
+  const urlKey = (url.searchParams.get('key') || '').toString();
+  const bearer = (() => {
+    const h = (req.headers['authorization'] || '').toString();
+    const m = h.match(/^Bearer\s+(.+)$/i);
+    return m ? m[1].trim() : '';
+  })();
+  const xUser = (req.headers['x-codex-user'] || '').toString().trim();
+  const token = bearer || xUser;
+
+  // Path 1: system via DEMO_SECRET (header or ?key=).
+  if (SHARED_SECRET && (demoKey === SHARED_SECRET || urlKey === SHARED_SECRET)) {
+    req.user = { id: 'system', name: 'system', isSystem: true, label: null };
+    return { ok: true, user: req.user };
+  }
+  // Path 2: token via Bearer or X-Codex-User.
+  if (token) {
+    const res = await users.resolveToken(token);
+    if (res.kind === 'ok') {
+      req.user = res.user;
+      return { ok: true, user: req.user };
+    }
+    if (res.kind === 'revoked') {
+      req.user = null;
+      return { ok: false, reason: 'token_revoked' };
+    }
+    // 'not_found' OR 'no_db' both fall through to invalid.
+    req.user = null;
+    return { ok: false, reason: 'token_invalid' };
+  }
+  // Path 3: SHARED_SECRET unset (v1 demo mode) → system user fallback.
+  if (!SHARED_SECRET) {
+    req.user = { id: 'system', name: 'system', isSystem: true, label: null };
+    return { ok: true, user: req.user };
+  }
+  // SHARED_SECRET set, no token supplied: 401.
+  req.user = null;
+  return { ok: false, reason: 'no_token' };
 }
 
 // Best-effort client IP. Trusts x-forwarded-for when present (we sit
@@ -1996,11 +2068,20 @@ function handleJobEvents(req, res, jobId) {
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'content-type, x-demo-key');
+  // mu-001: allow the auth headers the new identity layer needs.
+  // x-demo-key was already permitted; Bearer + X-Codex-User are new.
+  res.setHeader('Access-Control-Allow-Headers', 'content-type, x-demo-key, authorization, x-codex-user');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url, 'http://x');
+
+  // mu-001: resolve req.user at the top of the pipeline. The outcome
+  // is also stashed on req for handlers that want to inspect it. We do
+  // NOT 401 here for the no_token case — that would break v1 endpoints
+  // that use checkAuth() (e.g. /history, /run). The /admin/* routes
+  // gate on req.user below.
+  const auth = await resolveUser(req);
 
   // ISSUE-024: wrap res.end so we can emit one structured SLS line per
   // request with statusCode + durationMs. We do this in addition to
@@ -2034,6 +2115,10 @@ const server = http.createServer(async (req, res) => {
       authRequired: !!SHARED_SECRET,
       serverHasDefaultKey: !!SERVER_LLM_API_KEY,
       defaultModel: SERVER_LLM_DEFAULT_MODEL || null,
+      // mu-001: echo the resolved user id so callers can verify the
+      // token wiring without firing a real run (US-1.4).
+      userId: (req.user && req.user.id) || null,
+      isSystem: !!(req.user && req.user.isSystem),
       db: pgPool ? { host: RDS_HOST, name: RDS_DB, ok: dbOk } : null,
       pdf: {
         skillDir: PDF_SKILL_DIR,
@@ -2108,6 +2193,79 @@ const server = http.createServer(async (req, res) => {
     });
     return res.end(pdf);
   }
+  // ─── mu-001: admin routes (POST/GET /admin/users, revoke, stats) ───
+  // Gated by BOTH checkAuth (x-demo-key or ?key= matching SHARED_SECRET)
+  // AND SHARED_SECRET being set — when the secret is empty the admin
+  // path is closed (no admin = no user minting).
+  if (url.pathname === '/admin/users' || url.pathname.startsWith('/admin/users/')) {
+    if (!SHARED_SECRET) {
+      return json(res, 401, { ok: false, error: 'admin disabled (SHARED_SECRET not set)' });
+    }
+    if (!checkAuth(req)) {
+      return json(res, 401, { ok: false, error: 'unauthorized (admin requires x-demo-key or ?key=)' });
+    }
+    if (req.method === 'POST' && url.pathname === '/admin/users') {
+      const raw = await readBody(req);
+      let body; try { body = JSON.parse(raw || '{}'); } catch { return json(res, 400, { ok: false, error: 'bad json' }); }
+      const name = (body.name || '').toString();
+      const label = body.label != null ? body.label.toString() : null;
+      if (!name.trim()) return json(res, 400, { ok: false, error: 'name is required' });
+      try {
+        const u = await users.mintUser({ name, label });
+        slog('info', '[admin] mint user ' + u.id + ' name=' + u.name, { source: 'admin' });
+        return json(res, 201, {
+          ok: true,
+          id: u.id,
+          name: u.name,
+          label: u.label,
+          apiToken: u.apiToken,             // plaintext — exactly once
+          createdAt: u.createdAt,
+        });
+      } catch (e) {
+        if (e && e.code === 'NAME_TAKEN') return json(res, 409, { ok: false, error: 'name_taken', message: e.message });
+        if (e && e.code === 'SENTINEL_SYSTEM') return json(res, 409, { ok: false, error: 'sentinel_collision', message: e.message });
+        if (e && e.code === 'BAD_NAME') return json(res, 400, { ok: false, error: 'bad_name', message: e.message });
+        return json(res, 500, { ok: false, error: String(e && e.message || e) });
+      }
+    }
+    if (req.method === 'GET' && url.pathname === '/admin/users') {
+      try {
+        const list = await users.listUsers();
+        return json(res, 200, { ok: true, users: list });
+      } catch (e) {
+        return json(res, 500, { ok: false, error: String(e && e.message || e) });
+      }
+    }
+    // /admin/users/:id/revoke  +  /admin/users/:id/stats
+    const adminMatch = url.pathname.match(/^\/admin\/users\/([A-Za-z0-9_-]+)\/(revoke|stats)$/);
+    if (adminMatch) {
+      const id = adminMatch[1];
+      if (!id || !/^cdx_[A-Za-z0-9_-]+$/.test(id)) {
+        return json(res, 400, { ok: false, error: 'bad user id' });
+      }
+      if (req.method === 'POST' && adminMatch[2] === 'revoke') {
+        try {
+          const r = await users.revokeUser(id);
+          if (!r) return json(res, 404, { ok: false, error: 'user_not_found' });
+          slog('info', '[admin] revoke user ' + id, { source: 'admin' });
+          return json(res, 200, { ok: true, id: r.id, revokedAt: r.revokedAt });
+        } catch (e) {
+          return json(res, 500, { ok: false, error: String(e && e.message || e) });
+        }
+      }
+      if (req.method === 'GET' && adminMatch[2] === 'stats') {
+        try {
+          const stats = await users.getStats(id);
+          if (!stats) return json(res, 404, { ok: false, error: 'user_not_found' });
+          return json(res, 200, { ok: true, ...stats });
+        } catch (e) {
+          return json(res, 500, { ok: false, error: String(e && e.message || e) });
+        }
+      }
+    }
+    return json(res, 404, { ok: false, error: 'admin route not found' });
+  }
+
   // ─── static frontend ───
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
     const candidates = [
