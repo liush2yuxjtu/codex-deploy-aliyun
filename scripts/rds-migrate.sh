@@ -71,9 +71,12 @@ psql_run() {
 }
 psql_run_file() {
   if [[ "$USE_SSH" -eq 1 ]]; then
-    ssh -i "$SSH_KEY" "root@$SERVER_IP" PGPASSWORD="$RDS_PASSWORD" psql \
+    # Stream the local file over ssh; remote psql reads it from stdin.
+    # Using -f with a local path would fail because the path doesn't
+    # exist on the SWAS host.
+    cat "$1" | ssh -i "$SSH_KEY" "root@$SERVER_IP" PGPASSWORD="$RDS_PASSWORD" psql \
       -h "$RDS_HOST" -p "$RDS_PORT" -U "$RDS_USER" -d "$RDS_DB" \
-      -v ON_ERROR_STOP=1 -f "$1"
+      -v ON_ERROR_STOP=1 -A -t
   else
     PGPASSWORD="$RDS_PASSWORD" psql \
       -h "$RDS_HOST" -p "$RDS_PORT" -U "$RDS_USER" -d "$RDS_DB" \
