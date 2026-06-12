@@ -53,6 +53,16 @@ SSH_TARGET="$SERVER_USER@$SERVER_IP"
 SSH="ssh -i $SSH_KEY $SSH_TARGET"
 SCP="scp -i $SSH_KEY"
 
+# Pull Aliyun creds from the aliyun-start skill's .env so the local
+# rds-migrate.sh (step #5) can talk to RDS. The skill ships
+# RDS_PUBLIC/RDS_INTRANET, but rds-migrate.sh expects RDS_HOST.
+SKILL_DIR="${SKILL_DIR:-$HOME/.claude/skills/aliyun-start}"
+if [[ -f "$SKILL_DIR/.env" ]]; then
+  set -a; . "$SKILL_DIR/.env"; set +a
+fi
+: "${RDS_HOST:=${RDS_PUBLIC:-$RDS_INTRANET}}"
+export RDS_HOST
+
 log() { echo "[ecs-code-deploy] $*" >&2; }
 run() {
   if [[ "$DRY_RUN" -eq 1 ]]; then echo "  would: $*"; else eval "$@"; fi
