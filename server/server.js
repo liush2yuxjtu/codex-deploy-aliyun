@@ -977,6 +977,12 @@ async function handleRunAsync(req, res) {
     catch (e) { try { spawn.child.kill('SIGKILL'); } catch {} }
   }, timeoutS * 1000);
   killTimer.unref();
+  // T4 fix: stash the live child + kill timer on the job so
+  // POST /job/:id/cancel (handleJobCancel) can reach them. Without this,
+  // the cancel button is a 404.
+  job.child = spawn.child;
+  job.killTimer = killTimer;
+  job.cancelRequested = false;
 
   // ISSUE-012: per-line, debounced tail stream. We split each chunk on \n,
   // keep the trailing partial in a buffer, and emit a batch of {lines: [...]}
@@ -1079,7 +1085,21 @@ async function handleRunAsync(req, res) {
     job.fallbackReason = (requestedSessionId && !resumedOk) ? 'session_not_found' : null;
     try { fs.rmSync(spawn.workDir, { recursive: true, force: true }); } catch {}
 
-    if (job.killed) {
+    if (job.cancelRequested) {
+      // T4 fix: user-initiated cancel (issue 002). Treat as a separate
+      // terminal status from timeout so the UI can distinguish "user said
+      // stop" from "we ran out of time". exitCode 130 mirrors the
+      // conventional "killed by SIGINT/SIGTERM" signal-based exit.
+      job.state = 'cancelled';
+      job.ok = false;
+      job.error = 'cancelled by user';
+      job.exitCode = 130;
+      emitJob(job, 'cancelled', { ok: false, exitCode: 130, durationMs, error: job.error,
+        codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false });
+      emitJob(job, 'done', { ok: false, exitCode: 130, durationMs, error: job.error, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+        codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
+        ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) });
+    } else if (job.killed) {
       job.state = 'error';
       job.ok = false;
       job.error = 'timeout';
@@ -1117,7 +1137,7 @@ async function handleRunAsync(req, res) {
     // (ISSUE-002/004/013). Here we map job.state ('done' | 'error') to the
     // RDS codex_jobs.status enum; the timeout case uses 'timeout' so the
     // /job/:id reload path can surface it correctly.
-    const terminalStatus = job.killed ? 'timeout' : job.state;
+    const terminalStatus = job.cancelRequested ? 'cancelled' : (job.killed ? 'timeout' : job.state);
     Promise.resolve().then(() => updateCodexJobTerminal({
       jobId: job.id,
       status: terminalStatus,
@@ -1221,6 +1241,39 @@ async function handleJobStatus(req, res, jobId) {
 // — both shapes are accepted.
 //
 // Memory miss → 404. Frontend falls back to one-shot /job/:id poll which
+// T4 fix: POST /job/:id/cancel — issue 002's "异步卡片可取消" finally has
+// a server-side endpoint. Looks up the live job in the in-memory Map
+// (cancel against an already-GC'd / RDS-only job is 409, not 404 — the
+// job exists, it's just terminal and can't be cancelled any more).
+// Sends SIGTERM via killJobTree (issue 005); the child.on('close') path
+// in startCodexJob will then promote the job to 'cancelled' and emit
+// the SSE 'cancelled' event that 011 / 012 / 013 already listen for.
+async function handleJobCancel(req, res, jobId) {
+  const job = JOBS.get(jobId);
+  if (!job) {
+    // Memory miss → could be RDS-rebuilt (010) but the underlying codex
+    // process is dead by definition if it's no longer in JOBS. 410 Gone
+    // is the most truthful answer; the frontend treats 4xx uniformly as
+    // "already terminal".
+    return json(res, 410, { ok: false, error: 'job not in memory (already GCd or restarted)' });
+  }
+  if (job.state === 'done' || job.state === 'error' || job.state === 'cancelled' || job.state === 'timeout') {
+    return json(res, 409, { ok: false, error: 'job already terminal', state: job.state });
+  }
+  if (job.cancelRequested) {
+    return json(res, 200, { ok: true, jobId, state: job.state, alreadyCanceling: true });
+  }
+  job.cancelRequested = true;
+  if (job.killTimer) { try { clearTimeout(job.killTimer); } catch {} }
+  const child = job.child || null;
+  // Don't await — killJobTree is fire-and-forget here; the actual
+  // state transition happens when the child's `close` event fires.
+  killJobTree(child, { jobId, reason: 'user' })
+    .then(r => console.log(`[cancel] job=${jobId} kill result=${JSON.stringify(r)}`))
+    .catch(e => console.error(`[cancel] job=${jobId} kill error:`, e && e.message || e));
+  return json(res, 200, { ok: true, jobId, state: job.state, cancelRequested: true });
+}
+
 // already walks RDS (ISSUE-010).
 function handleJobEvents(req, res, jobId) {
   const url = new URL(req.url, 'http://x');
@@ -1352,11 +1405,14 @@ const server = http.createServer(async (req, res) => {
     catch (e) { return json(res, 500, { ok: false, error: String(e && e.message || e) }); }
   }
   // /job/:id  and  /job/:id/events  — async job state + SSE
-  const jobMatch = url.pathname.match(/^\/job\/([0-9a-f-]{36})(?:\/events)?$/);
-  if (req.method === 'GET' && jobMatch) {
+  const jobMatch = url.pathname.match(/^\/job\/([0-9a-f-]{36})(?:\/events|\/cancel)?$/);
+  if (jobMatch) {
     const jobId = jobMatch[1];
-    if (url.pathname.endsWith('/events')) return handleJobEvents(req, res, jobId);
-    return await handleJobStatus(req, res, jobId);
+    if (req.method === 'POST' && url.pathname.endsWith('/cancel')) {
+      return await handleJobCancel(req, res, jobId);
+    }
+    if (req.method === 'GET' && url.pathname.endsWith('/events')) return handleJobEvents(req, res, jobId);
+    if (req.method === 'GET') return await handleJobStatus(req, res, jobId);
   }
   // ─── /pdf: URL or local path → PDF via md-to-pdf-webfirst skill ───
   if (req.method === 'POST' && (url.pathname === '/pdf' || url.pathname === '/pdf/from-url')) {
