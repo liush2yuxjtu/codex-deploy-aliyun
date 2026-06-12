@@ -61,7 +61,8 @@ if [[ -f "$SKILL_DIR/.env" ]]; then
   set -a; . "$SKILL_DIR/.env"; set +a
 fi
 : "${RDS_HOST:=${RDS_PUBLIC:-$RDS_INTRANET}}"
-export RDS_HOST
+: "${RDS_USER:=$RDS_ADMIN}"
+export RDS_HOST RDS_USER
 
 log() { echo "[ecs-code-deploy] $*" >&2; }
 run() {
