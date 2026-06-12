@@ -314,6 +314,33 @@ function parseCodexSessionId(stdoutOrStderr) {
   return m ? m[0] : null;
 }
 
+// ─── extractFinalAnswer (chat UX) ───
+// Codex CLI's human-readable output emits a `codex` line on its own as the
+// marker for an assistant turn. The first such block in a turn is the
+// model's internal reasoning (which may include tool calls like
+// "web search: ..."). The LAST such block is the final answer the user
+// actually wants to read. We extract that last block, leaving the raw
+// transcript in `stdout` for the audit panel.
+//
+// Robust to:
+//   - multiple "codex" turns in one transcript (reasoning → tool calls →
+//     final answer); the last wins
+//   - missing marker (e.g. error transcripts, resume failures) → returns ''
+//   - trailing whitespace / blank lines / leading "codex" header noise
+//   - `codex` appearing inside prose (only standalone lines match, so a
+//     sentence containing the word "codex" doesn't false-match)
+function extractFinalAnswer(stdout) {
+  if (!stdout) return '';
+  const text = String(stdout);
+  const lines = text.split('\n');
+  let lastIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() === 'codex') { lastIdx = i; break; }
+  }
+  if (lastIdx === -1) return '';
+  return lines.slice(lastIdx + 1).join('\n').replace(/^\s+|\s+$/g, '');
+}
+
 // ─── async /run: in-memory job store + per-job EventEmitter for SSE ───
 const JOBS = new Map();              // jobId -> { state, emitter, ... }
 const JOBS_TTL_MS = 60 * 60 * 1000;  // GC finished jobs after 1h
@@ -1093,22 +1120,27 @@ async function handleRun(req, res) {
     const codexSessionId = parseCodexSessionId(stdout + '\n' + stderr);
     const requestedSessionId = sessionId || null;
     const resumedOk = !!requestedSessionId && code === 0 && !!codexSessionId && codexSessionId === requestedSessionId;
+    // Chat UX: pull the final assistant answer out of the raw transcript so
+    // the frontend can render it as the main bubble content instead of the
+    // banner / reasoning / web-search / sandbox noise. Empty string when
+    // the transcript has no recognisable "codex" turn marker.
+    const finalAnswer = extractFinalAnswer(stdout);
     try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
 
     let payload, status;
     if (killed) {
       status = 504;
-      payload = { ok: false, exitCode: 124, error: 'timeout', runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
+      payload = { ok: false, exitCode: 124, error: 'timeout', runId, durationMs, spawnMs, gatewayMs, quotaExceeded, finalAnswer, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: resumedOk,
         ...(requestedSessionId && !resumedOk ? { fallbackReason: 'session_not_found' } : {}) };
     } else if (code === 0) {
       status = 200;
-      payload = { ok: true, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
+      payload = { ok: true, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, finalAnswer, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: resumedOk,
         ...(requestedSessionId && !resumedOk ? { fallbackReason: 'session_not_found' } : {}) };
     } else {
       status = 502;
-      payload = { ok: false, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
+      payload = { ok: false, exitCode: code, runId, durationMs, spawnMs, gatewayMs, quotaExceeded, finalAnswer, stdout: stdout.slice(-65536), stderr: stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
         ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) };
     }
@@ -1386,6 +1418,10 @@ async function handleRunAsync(req, res) {
     job.parentSessionId = requestedSessionId;
     job.resumed = resumedOk;
     job.fallbackReason = (requestedSessionId && !resumedOk) ? 'session_not_found' : null;
+    // Chat UX: pull the final assistant answer out of the raw transcript so
+    // the frontend can render it as the main bubble content instead of the
+    // banner / reasoning / web-search / sandbox noise.
+    const finalAnswer = extractFinalAnswer(job.stdout);
     try { fs.rmSync(spawn.workDir, { recursive: true, force: true }); } catch {}
 
     if (job.cancelRequested) {
@@ -1399,7 +1435,7 @@ async function handleRunAsync(req, res) {
       job.exitCode = 130;
       emitJob(job, 'cancelled', { ok: false, exitCode: 130, durationMs, error: job.error,
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false });
-      emitJob(job, 'done', { ok: false, exitCode: 130, durationMs, error: job.error, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+      emitJob(job, 'done', { ok: false, exitCode: 130, durationMs, error: job.error, finalAnswer, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
         ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) });
     } else if (job.killed) {
@@ -1407,20 +1443,20 @@ async function handleRunAsync(req, res) {
       job.ok = false;
       job.error = 'timeout';
       job.exitCode = 124;
-      emitJob(job, 'done', { ok: false, exitCode: 124, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, error: job.error, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+      emitJob(job, 'done', { ok: false, exitCode: 124, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, error: job.error, finalAnswer, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
         ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) });
     } else if (code === 0) {
       job.state = 'done';
       job.ok = true;
-      emitJob(job, 'done', { ok: true, exitCode: 0, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+      emitJob(job, 'done', { ok: true, exitCode: 0, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, finalAnswer, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: resumedOk,
         ...(requestedSessionId && !resumedOk ? { fallbackReason: 'session_not_found' } : {}) });
     } else {
       job.state = 'error';
       job.ok = false;
       job.error = 'codex exit ' + code;
-      emitJob(job, 'done', { ok: false, exitCode: code, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
+      emitJob(job, 'done', { ok: false, exitCode: code, durationMs, spawnMs: job.spawnMs, gatewayMs: job.gatewayMs, quotaExceeded: job.quotaExceeded, finalAnswer, stdout: job.stdout.slice(-65536), stderr: job.stderr.slice(-8192),
         codexSessionId: codexSessionId || null, parentSessionId: requestedSessionId, resumed: false,
         ...(requestedSessionId ? { fallbackReason: 'session_not_found' } : {}) });
     }
