@@ -110,8 +110,8 @@ fi
 
 # ─── 5. migrate ───────────────────────────────────────────────────────
 if [[ "$SERVER_ONLY" -eq 0 ]]; then
-  log "apply migrations on $SERVER_IP (via scripts/rds-migrate.sh --ssh)"
-  run "$SSH \"bash $SERVER_DIR/scripts/rds-migrate.sh --ssh\""
+  log "apply migrations on $SERVER_IP (via scripts/rds-migrate.sh --ssh, local)"
+  run "bash $REPO_DIR/scripts/rds-migrate.sh --ssh"
 fi
 
 # ─── 6. restart + 7. verify ───────────────────────────────────────────
