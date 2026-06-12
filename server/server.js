@@ -251,16 +251,17 @@ async function updateCodexJobStatus(row) {
 // Returns null if the row doesn't exist or the DB is unavailable. The returned
 // shape mirrors what handleJobStatus writes back (emitter=null, no event
 // replay — that path is SSE-only and stays memory-resident).
-async function loadJobFromRds(jobId) {
+async function loadJobFromRds(jobId, userId) {
   if (!pgPool) return null;
   try {
     const r = await pgPool.query(
       `SELECT job_id, status, prompt, model, started_at, finished_at,
               duration_ms, exit_code, client_ip, last_event_ts,
-              stdout_path, stderr_path
+              stdout_path, stderr_path, user_id
          FROM codex_jobs
-        WHERE job_id = $1`,
-      [jobId]
+        WHERE job_id = $1
+          AND (user_id = $2 OR $2 = 'system')`,
+      [jobId, userId == null ? 'system' : String(userId)]
     );
     if (!r.rows.length) return null;
     const row = r.rows[0];
@@ -279,6 +280,7 @@ async function loadJobFromRds(jobId) {
       durationMs: row.duration_ms != null ? parseInt(row.duration_ms, 10) : null,
       exitCode: row.exit_code,
       clientIp: row.client_ip,
+      userId: row.user_id || null,
       runId: null,
       spawnMs: null, gatewayMs: null,
       ok: s === 'done',
@@ -2100,6 +2102,11 @@ async function handleRunAsync(req, res) {
 async function handleJobStatus(req, res, jobId) {
   const job = JOBS.get(jobId);
   if (job) {
+    // mu-005: ownership check (AP-1, AP-8). 404 (not 403) so existence
+    // doesn't leak across users (AP-4).
+    if (job.userId && job.userId !== req.user.id && !req.user.isSystem) {
+      return json(res, 404, { ok: false, error: 'not_found' });
+    }
     return json(res, 200, {
       ok: true, jobId: job.id, state: job.state, runId: job.runId,
       prompt: job.prompt, model: job.model, started: job.started, finished: job.finished,
@@ -2120,7 +2127,7 @@ async function handleJobStatus(req, res, jobId) {
   }
   // Memory miss → fall through to RDS (ISSUE-010). This is what makes
   // /job/:id survive a process restart / 60-min Map GC.
-  const rdsJob = await loadJobFromRds(jobId);
+  const rdsJob = await loadJobFromRds(jobId, req.user && req.user.id);
   if (!rdsJob) return json(res, 404, { ok: false, error: 'job not found or expired' });
   let stdoutTail = '', stderrTail = '';
   try {
@@ -2170,6 +2177,12 @@ async function handleJobCancel(req, res, jobId) {
     // "already terminal".
     return json(res, 410, { ok: false, error: 'job not in memory (already GCd or restarted)' });
   }
+  // mu-005: ownership check (AP-1, AP-8). 404 (not 410 / not 403) so
+  // existence doesn't leak across users (AP-4). 410 is reserved for the
+  // memory-miss "not in flight" case above.
+  if (job.userId && job.userId !== req.user.id && !req.user.isSystem) {
+    return json(res, 404, { ok: false, error: 'not_found' });
+  }
   if (job.state === 'done' || job.state === 'error' || job.state === 'cancelled' || job.state === 'timeout') {
     return json(res, 409, { ok: false, error: 'job already terminal', state: job.state });
   }
@@ -2198,15 +2211,22 @@ function handleJobEvents(req, res, jobId) {
   const job = JOBS.get(jobId);
   if (!job) return json(res, 404, { ok: false, error: 'job not found or expired' });
 
-  // D-route isolation: only the job's creator (matched by client_ip)
-  // can subscribe to its SSE stream. Without this, any leak of a
-  // runId/jobId — e.g. a /history listing that exposes them — lets
-  // third parties attach to someone else's live output.
+  // D-route isolation (mu-005): only the job's creator can subscribe
+  // to its SSE stream. Without this, any leak of a runId/jobId — e.g.
+  // a /history listing that exposes them — lets third parties attach
+  // to someone else's live output.
   //
-  // Fail-open when job.clientIp is null: legacy jobs from before this
-  // fix had no IP captured, and we don't want to wedge in-flight
-  // streams. New jobs always have clientIp set via reqClientIp.
-  if (job.clientIp) {
+  // Primary check is by userId (AP-1, AP-8). Legacy in-flight streams
+  // from before mu-003 (where job.userId == null) fall through to the
+  // pre-mu-005 client_ip check, which we keep so those streams don't
+  // wedge at deploy time. SSE is authenticated so 403 is acceptable
+  // here even though /job/:id returns 404 (AP-4 — same existence-leak
+  // concern, but the SSE handshake is a different surface).
+  if (job.userId) {
+    if (job.userId !== req.user.id && !req.user.isSystem) {
+      return json(res, 403, { ok: false, error: 'forbidden: not the job creator' });
+    }
+  } else if (job.clientIp) {
     const reqIp = reqClientIp(req);
     if (reqIp !== job.clientIp) {
       return json(res, 403, { ok: false, error: 'forbidden: not the job creator' });
