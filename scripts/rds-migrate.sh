@@ -60,9 +60,12 @@ done
 # ─── psql invocation: local or via SSH ────────────────────────────────
 psql_run() {
   if [[ "$USE_SSH" -eq 1 ]]; then
-    ssh -i "$SSH_KEY" "root@$SERVER_IP" PGPASSWORD="$RDS_PASSWORD" psql \
+    # Pipe the SQL through ssh into the remote psql. Bash-quoting a
+    # SQL string with embedded single quotes inside an ssh "cmd" arg
+    # is a quoting nightmare; piping sidesteps it entirely.
+    echo "$1" | ssh -i "$SSH_KEY" "root@$SERVER_IP" PGPASSWORD="$RDS_PASSWORD" psql \
       -h "$RDS_HOST" -p "$RDS_PORT" -U "$RDS_USER" -d "$RDS_DB" \
-      -v ON_ERROR_STOP=1 -A -t -c "'$1'"
+      -v ON_ERROR_STOP=1 -A -t
   else
     PGPASSWORD="$RDS_PASSWORD" psql \
       -h "$RDS_HOST" -p "$RDS_PORT" -U "$RDS_USER" -d "$RDS_DB" \
