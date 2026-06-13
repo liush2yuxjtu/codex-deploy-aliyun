@@ -217,7 +217,8 @@ async function getStats(id, deps = {}) {
     // bug-010: live per-user queue depth via the userSlots bridge
     // populated by server.js. Defensive — server may not have wired
     // the bridge yet (test harnesses, scripts).
-    queued: (typeof globalThis.__userSlots === 'object' && globalThis.__userSlots && (globalThis.__userSlots.get(id) || { queued: [] }).queued.length) || 0,
+    // __userSlots is a lazy accessor () => Map; call it to deref.
+    queued: (() => { try { const slots = (typeof globalThis.__userSlots === 'function' ? globalThis.__userSlots() : null); return (slots && (slots.get(id) || { queued: [] }).queued.length) || 0; } catch { return 0; } })(),
   };
 }
 

@@ -110,7 +110,9 @@ globalThis.__pgPool = () => pgPool;
 globalThis.__slog = slog;
 // bug-010: bridge the per-user queue map so users.getStats() can return
 // live queued counts instead of the stale `queued: 0` placeholder.
-globalThis.__userSlots = userSlots;
+// Lazy accessor — `userSlots` is declared further down (TDZ if referenced
+// at module-init time before line ~547).
+globalThis.__userSlots = () => userSlots;
 
 async function recordRun(row) {
   if (!pgPool) return;
