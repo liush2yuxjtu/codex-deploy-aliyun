@@ -192,10 +192,36 @@ function parseFrontmatter(text) {
   const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!m) return {};
   const out = {};
-  for (const line of m[1].split(/\r?\n/)) {
+  const lines = m[1].split(/\r?\n/);
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
     const kv = line.match(/^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/);
-    if (!kv) continue;
-    out[kv[1]] = parseValue(kv[2]);
+    if (!kv) { i++; continue; }
+    const key = kv[1];
+    const rest = (kv[2] ?? '').trim();
+    if (rest === '') {
+      // Multi-line list form: `key:\n  - item1\n  - item2`. Walk forward
+      // through indented `- ` items, accumulating them as the key's value.
+      // Mirrors mock-gen.mjs:parseFrontmatter so the two parsers agree on
+      // the same fixture (was: this branch returned null and `?? []` then
+      // treated every multi-line `blocked_by:` as "no deps" — see oa-002
+      // follow-up #3 in .afk-agents-report.md).
+      const items = [];
+      let j = i + 1;
+      while (j < lines.length) {
+        const itemLine = lines[j];
+        const itemMatch = itemLine.match(/^\s+-\s+(.*)$/);
+        if (!itemMatch) break;
+        items.push(parseValue(itemMatch[1].trim()));
+        j++;
+      }
+      out[key] = items;
+      i = j;
+      continue;
+    }
+    out[key] = parseValue(rest);
+    i++;
   }
   return out;
 }
