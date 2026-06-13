@@ -1326,7 +1326,8 @@ function sanitizePdfError(err, kind) {
     return '源 URL 返回 4xx/5xx。请确认链接有效。';
   }
   if (/timed?\s*out|timed out after|TimeoutExpired|SIGKILL/i.test(msg)) {
-    return 'PDF 生成超时(超过 3 分钟)。请尝试更小的输入或稍后重试。';
+    // bug-002: drive the copy off PDF_TIMEOUT_MS so future tunings don't drift.
+    return 'PDF 生成超时(超过 ' + Math.round(PDF_TIMEOUT_MS / 1000) + ' 秒)。请尝试更小的输入或稍后重试。';
   }
   if (/not produced at/i.test(msg)) {
     return 'PDF 技能未产出文件。可能是输入格式不被支持或源页面脚本渲染失败。';
