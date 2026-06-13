@@ -1692,62 +1692,16 @@ async function handleRun(req, res) {
   // response payload for frontend transparency.
   const { prompt: effectivePrompt, weather } = await maybeEnrichWithWeather(prompt);
 
-  const runId = randomUUID();
-  const workDir = path.join(RUN_BASE, runId);
-  fs.mkdirSync(workDir, { recursive: true, mode: 0o770 });
-  // chown to codexsbx so the user can write inside
-  try {
-    const { execSync } = require('child_process');
-    execSync(`chown ${SANDBOX_USER}:${SANDBOX_USER} ${workDir}`);
-  } catch (e) { /* best-effort */ }
-
-  // Build the codex command. Every config injected per-call via -c so no
-  // shared on-disk state can drift between requests (codex was self-rewriting
-  // config.toml with an outdated wire_api on cold start).
-  // ISSUE-014: when sessionId is present, the CLI invocation becomes
-  //   codex exec resume <sid> <prompt>
-  // — see startCodexJob; the args we build here mirror that path.
-  const codexArgs = [
-    'exec',
-    '--ignore-user-config',                                  // do not read ~/.codex/config.toml
-    '-c', 'model_provider="newcli"',
-    '-c', 'model_providers.newcli.name="newcli"',
-    '-c', 'model_providers.newcli.base_url="https://code.newcli.com/codex/v1"',
-    '-c', 'model_providers.newcli.wire_api="responses"',     // gateway uses /v1/responses
-    '-c', 'model_providers.newcli.env_key="LLM_API_KEY"',
-    '-c', 'model_providers.newcli.request_max_retries=1',
-    '-c', 'model_providers.newcli.stream_max_retries=1',
-    '-c', 'disable_response_storage=true',
-    '-c', 'approval_policy="never"',
-    '-s', 'workspace-write',
-    '--skip-git-repo-check',
-    '--ephemeral',
-    '--color', 'never',
-    '-C', workDir,
-  ];
-  if (effectiveModel) codexArgs.push('-m', effectiveModel);
-  if (sessionId) {
-    codexArgs.push('resume', sessionId, effectivePrompt);
-  } else {
-    codexArgs.push(effectivePrompt);
-  }
-
-  const started = Date.now();
-  const child = spawn(CODEX_BIN, codexArgs, {
-    uid: SANDBOX_UID,
-    gid: SANDBOX_GID,
-    cwd: workDir,
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: {
-      PATH: '/opt/node-v20.18.1-linux-x64/bin:/usr/local/bin:/usr/bin:/bin',
-      HOME: `/home/${SANDBOX_USER}`,
-      USER: SANDBOX_USER,
-      LLM_API_KEY: effectiveKey,
-      OPENAI_API_KEY: effectiveKey,
-      TERM: 'dumb',
-      NO_COLOR: '1',
-    },
+  // Delegate codexArgs construction + child spawn to the shared helper
+  // (bug-009). Same contract as handleRunAsync post-bug-001; killTimer
+  // remains in handleRun because the timeout-driven SIGKILL is sync-only.
+  const { child, runId, workDir, started } = startCodexJob({
+    prompt: effectivePrompt,
+    effectiveKey,
+    effectiveModel,
+    timeoutS,
+    clientIp,
+    sessionId,
   });
   let stdout = '', stderr = '', killed = false;
   let firstByteMs = null;   // ms from spawn to first stdout/stderr byte (proxy for "first model token")
