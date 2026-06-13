@@ -83,6 +83,39 @@ function makeSlice({ id, title = 'slice ' + id, blocked_by = [], mock = false, t
   return `---\n${fm}\n---\n\n# ${id}\n`;
 }
 
+// Multi-line-list frontmatter builder. Mirrors the YAML the /to-issues
+// generator (and oa-007's e2e mui fixture) actually emits for
+// `blocked_by:` / `mock_refines:` / `mocks:`:
+//   key:
+//     - item1
+//     - item2
+// See oa-002 follow-up #3 in .afk-agents-report.md — the previous parser
+// returned null for the empty value after the key, then `?? []` treated
+// every slice as dep-free. The fix in ready-edge.mjs:parseFrontmatter
+// now walks the indented `- ` items forward, mirroring
+// mock-gen.mjs:parseFrontmatter.
+function makeSliceMultiline({ id, title = 'slice ' + id, blocked_by = [], mock = false, type = 'AFK', triage = 'ready-for-agent', mock_refines = [] }) {
+  const lines = [
+    `id: ${id}`,
+    `title: ${title}`,
+    `type: ${type}`,
+    `round: 1`,
+    `mock: ${mock ? 'true' : 'false'}`,
+  ];
+  if (blocked_by.length === 0) {
+    lines.push(`blocked_by: []`);
+  } else {
+    lines.push(`blocked_by:`);
+    for (const b of blocked_by) lines.push(`  - ${b}`);
+  }
+  if (mock_refines.length > 0) {
+    lines.push(`mock_refines:`);
+    for (const r of mock_refines) lines.push(`  - ${r}`);
+  }
+  lines.push(`triage: ${triage}`);
+  return `---\n${lines.join('\n')}\n---\n\n# ${id}\n`;
+}
+
 function logLine(edge, status, extras = {}) {
   return JSON.stringify({ ts: '2026-06-13T00:00:00Z', edge, status, dispatcher: 'office', ...extras });
 }
@@ -367,6 +400,111 @@ function eightSlices(mockIds = []) {
     failed++;
     failures.push({ name: 'bonus: idempotent', r1: r1.parsed, r2: r2.parsed });
     console.log('  FAIL bonus: idempotent violated');
+  }
+}
+
+// ─── CASE 7: multi-line blocked_by form parsed correctly (oa-002 follow-up #3)
+// Before the fix: `blocked_by:\n  - mu-001` parsed as null, then `?? []`
+// treated every slice as dep-free and the entire graph fired in pass 1.
+// After the fix: parseFrontmatter walks the indented `- ` items forward
+// (mirrors mock-gen.mjs:parseFrontmatter), so the mui fixture's realistic
+// 4-pass wave structure is preserved end-to-end.
+{
+  const { issuesDir, stateLogPath } = newDir('case7-multiline-blocked-by');
+  const slices = [
+    ['mu-001.md', makeSliceMultiline({ id: 'mu-001', blocked_by: [] })],
+    ['mu-002.md', makeSliceMultiline({ id: 'mu-002', blocked_by: ['mu-001'] })],
+    ['mu-003.md', makeSliceMultiline({ id: 'mu-003', blocked_by: ['mu-001'] })],
+    ['mu-004.md', makeSliceMultiline({ id: 'mu-004', blocked_by: ['mu-002', 'mu-003'] })],
+    ['mu-005.md', makeSliceMultiline({ id: 'mu-005', blocked_by: ['mu-002'] })],
+    ['mu-006.md', makeSliceMultiline({ id: 'mu-006', blocked_by: ['mu-001'] })],
+    ['mu-007.md', makeSliceMultiline({ id: 'mu-007', blocked_by: ['mu-006'] })],
+    ['mu-008.md', makeSliceMultiline({ id: 'mu-008', blocked_by: ['mu-004', 'mu-007'] })],
+  ];
+  // Pass 1: no deps landed -> only mu-001 (the no-dep root) is ready.
+  // This is the exact bug the fix addresses — pre-fix, all 8 fired in pass 1.
+  const r1 = runScript({ slices, issuesDir, stateLogPath });
+  assertCase('case7a: multi-line blocked_by: no deps landed -> mu-001 only ready (no longer all-8)', {
+    readyEdges: ['mu-001'], inFlight: [], stuck: [], allLanded: false, auditReady: false,
+  }, r1.parsed);
+
+  // Pass 2: mu-001 landed -> mu-002 + mu-003 + mu-006 ready (multi-line list
+  // correctly interpreted as a 1-element dep set each).
+  const log2 = [logLine('mu-001', 'dispatched'), logLine('mu-001', 'landed')];
+  const r2 = runScript({ slices, logLines: log2, issuesDir, stateLogPath });
+  assertCase('case7b: multi-line blocked_by: mu-001 landed -> mu-002/003/006 ready', {
+    readyEdges: ['mu-002', 'mu-003', 'mu-006'], inFlight: [], stuck: [], allLanded: false, auditReady: false,
+  }, r2.parsed);
+
+  // Pass 3: mu-001+002+003+006 landed -> mu-004 (deps mu-002+mu-003) + mu-005
+  // (dep mu-002) + mu-007 (dep mu-006) ready. This is the load-bearing case:
+  // pre-fix, mu-004 was already in pass 1, so the multi-dep graph was
+  // invisible. Post-fix, the realistic wave 3 is visible.
+  const log3 = [
+    logLine('mu-001', 'dispatched'), logLine('mu-001', 'landed'),
+    logLine('mu-002', 'dispatched'), logLine('mu-002', 'landed'),
+    logLine('mu-003', 'dispatched'), logLine('mu-003', 'landed'),
+    logLine('mu-006', 'dispatched'), logLine('mu-006', 'landed'),
+  ];
+  const r3 = runScript({ slices, logLines: log3, issuesDir, stateLogPath });
+  assertCase('case7c: multi-line blocked_by: multi-dep graph -> mu-004/005/007 ready in pass 3', {
+    readyEdges: ['mu-004', 'mu-005', 'mu-007'], inFlight: [], stuck: [], allLanded: false, auditReady: false,
+  }, r3.parsed);
+
+  // Pass 4: every real landed -> mu-008 (the convergence node, deps mu-004
+  // and mu-007) is the only remaining slice. Confirms the multi-dep
+  // semantics survive across the full 4-pass structure.
+  const log4 = [];
+  for (let i = 1; i <= 7; i++) {
+    const id = i === 8 ? null : `mu-00${i}`;
+    if (id) {
+      log4.push(logLine(id, 'dispatched'));
+      log4.push(logLine(id, 'landed'));
+    }
+  }
+  const r4 = runScript({ slices, logLines: log4, issuesDir, stateLogPath });
+  assertCase('case7d: multi-line blocked_by: pass 4 -> mu-008 (multi-dep convergence) ready', {
+    readyEdges: ['mu-008'], inFlight: [], stuck: [], allLanded: false, auditReady: false,
+  }, r4.parsed);
+}
+
+// ─── CASE 8: multi-line mock_refines list parsed correctly
+// Defends the same look-ahead against a different multi-line list field.
+// Pre-fix, `mock_refines:` (used by mock-gen.mjs to decide which mocks
+// auto-refine when a real lands) would have collapsed to null, breaking
+// oa-003's mock refinement dispatch.
+{
+  const { issuesDir, stateLogPath } = newDir('case8-multiline-mock-refines');
+  const slices = [
+    ['mu-001.md', makeSlice({ id: 'mu-001', blocked_by: [] })],
+    ['mu-mock-audit.md', makeSliceMultiline({
+      id: 'mu-mock-audit',
+      title: 'mock:audit final sweep',
+      blocked_by: [],
+      mock: true,
+      mock_refines: ['mu-001', 'mu-002', 'mu-003'],
+    })],
+  ];
+  // mu-001 is no-dep real, ready. mu-mock-audit has mock: true + title
+  // starts with "mock:audit" — surfaces as a ready edge per the audit
+  // promotion rule (line 130-141). The point of this case is that the
+  // multi-line `mock_refines:` list was parsed correctly (otherwise
+  // mock-gen.mjs:refineMockBody would silently no-op when mu-001/002/003
+  // land — but ready-edge.mjs doesn't read mock_refines, so we just
+  // assert the file is loadable end-to-end with no crash/warn).
+  // auditReady stays false because mu-001 is not yet landed
+  // (auditReady requires allRealLanded, see line 161-165).
+  const r = runScriptCaptureStderr({ slices, issuesDir, stateLogPath });
+  assertCase('case8: multi-line mock_refines list parses without crashing', {
+    readyEdges: ['mu-001', 'mu-mock-audit'], inFlight: [], stuck: [], allLanded: false, auditReady: false,
+  }, r.parsed);
+  if (!r.stderr.includes('mock_refines') && !r.stderr.toLowerCase().includes('parse')) {
+    passed++;
+    console.log('  ok  case8: multi-line mock_refines: no parser-related stderr warn');
+  } else {
+    failed++;
+    failures.push({ name: 'case8: mock_refines warn', stderr: r.stderr });
+    console.log('  FAIL case8: multi-line mock_refines: should not warn; stderr was: ' + r.stderr);
   }
 }
 
