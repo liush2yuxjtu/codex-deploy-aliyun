@@ -61,7 +61,7 @@ The gold-metric verification per PRD §12 SC-7: run `/office-agents` against the
 
 ### Commit
 
-- `TBD` — single atomic commit; pushed to `origin/main` immediately after.
+- `0aa223d` — `feat(office-agents): oa-007 e2e wall-clock harness — SC-7 gold-metric verification` — single atomic commit; pushed to `origin/main` immediately after.
 
 ### Result
 
