@@ -1253,7 +1253,7 @@ const PDF_SCRIPT     = path.join(PDF_SKILL_DIR, 'scripts', 'md_to_pdf_webfirst.p
 const PDF_OUTPUT_BASE = process.env.PDF_OUTPUT_DIR
   || path.join(os.tmpdir(), 'codex-pdf-out');
 const PDF_TMP_BASE    = path.join(os.tmpdir(), 'codex-pdf-up');
-const PDF_TIMEOUT_MS  = 180 * 1000; // 3 min for a full skill run
+const PDF_TIMEOUT_MS  = 60 * 1000;  // 60s hard ceiling; aligns with --timeout=10000 in print_pdf + watchdog safety. Was 3 min, which let the 6-min "drag-html hangs forever" bug ship.
 
 // Per-user output dir: <base>/<userId>/ — userId is a TEXT (cdx_… or 'system').
 // Slash in userId is rejected to avoid directory traversal; caller side already
