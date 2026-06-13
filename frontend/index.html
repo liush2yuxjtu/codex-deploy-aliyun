@@ -1538,8 +1538,10 @@ async function sendMessage() {
   // "PDF 主题词 + 至少一个动词" so generic chat doesn't fall through.
   if (!Array.isArray(window.__codexAsyncKeywords)) {
     window.__codexAsyncKeywords = [
-      'pdf', '导出', 'export', 'render', '渲染',
-      '生成.*pdf', '做.*pdf', '转.*pdf', '弄.*pdf', '\\.pdf',
+      'pdf', '导出', '渲染',
+      '导出.*pdf', '生成.*pdf', '做.*pdf', '转.*pdf', '弄.*pdf', '渲染.*pdf',
+      '\\.pdf',
+      'render.*pdf', 'export.*pdf',
     ];
   }
   const ASYNC_RE = new RegExp(window.__codexAsyncKeywords.join('|'), 'i');

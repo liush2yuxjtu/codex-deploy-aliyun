@@ -108,6 +108,9 @@ if (RDS_HOST && RDS_DB && RDS_USER) {
 // isolation by passing a `{ pgPool, slog }` deps object.
 globalThis.__pgPool = () => pgPool;
 globalThis.__slog = slog;
+// bug-010: bridge the per-user queue map so users.getStats() can return
+// live queued counts instead of the stale `queued: 0` placeholder.
+globalThis.__userSlots = userSlots;
 
 async function recordRun(row) {
   if (!pgPool) return;
@@ -772,7 +775,7 @@ function startCodexJob({ prompt, effectiveKey, effectiveModel, timeoutS, clientI
   // downgrade to a fresh session.
   const trimmedSession = (sessionId || '').toString().trim();
   const codexArgs = [
-    trimmedSession ? 'exec' : 'exec',
+    'exec',
     '--ignore-user-config',
     '-c', 'model_provider="newcli"',
     '-c', 'model_providers.newcli.name="newcli"',

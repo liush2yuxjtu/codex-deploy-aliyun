@@ -214,7 +214,10 @@ async function getStats(id, deps = {}) {
     runs: runsR.rows[0].n,
     jobs: jobsR.rows[0].n,
     pdfs: pdfsR.rows[0].n,
-    queued: 0,   // future: per-user queue depth; mu-005 will populate
+    // bug-010: live per-user queue depth via the userSlots bridge
+    // populated by server.js. Defensive — server may not have wired
+    // the bridge yet (test harnesses, scripts).
+    queued: (typeof globalThis.__userSlots === 'object' && globalThis.__userSlots && (globalThis.__userSlots.get(id) || { queued: [] }).queued.length) || 0,
   };
 }
 
