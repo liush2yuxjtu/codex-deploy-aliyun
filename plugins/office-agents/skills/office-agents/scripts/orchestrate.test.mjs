@@ -481,6 +481,88 @@ test('idempotency: second pass with no state change returns same ready set, no r
 });
 
 // ---------------------------------------------------------------------------
+// Test 7 — audit fired detection works for arbitrary audit-slice ids
+//          (follow-up #2)
+//
+// Regression: `auditFiredInLog()` previously used the regex
+// `/^oa-mock-audit|^mock-audit|^audit$/i` which did NOT match ids like
+// `mu-mock-audit` (the multi-user-isolation fixture's audit slice). The
+// fix detects audit by the structural predicate
+// `mock: true && title.toLowerCase().startsWith('mock:audit')` — the
+// same predicate ready-edge.mjs uses at line 131 — and looks up the
+// matching slice ids from the slice set before scanning the state log.
+// ---------------------------------------------------------------------------
+
+test('audit fired detection: works for mu-mock-audit id (arbitrary id scheme)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'oa-005-audit-'));
+  const stateLogPath = join(dir, '.office-agents-edge.log');
+  try {
+    // Slice set with an audit slice whose id is `mu-mock-audit` (NOT
+    // matching the old `oa-mock-audit` / `mock-audit` / `audit` regex),
+    // and a single real AFK slice that satisfies the allLanded gate.
+    const slices = {
+      'real-1.md': `---
+id: real-1
+title: real slice
+type: AFK
+round: 1
+mock: false
+blocked_by: []
+triage: ready-for-agent
+status: pending
+---
+
+# real-1
+`,
+      'mu-mock-audit.md': `---
+id: mu-mock-audit
+title: mock:audit final sweep
+type: AFK
+round: 99
+mock: true
+blocked_by: [real-1]
+triage: ready-for-agent
+status: pending
+---
+
+# mu-mock-audit
+`,
+    };
+    for (const [file, content] of Object.entries(slices)) {
+      await writeFile(join(dir, file), content, 'utf8');
+    }
+
+    // Seed the log so real-1 is dispatched+landed AND the audit slice
+    // has been dispatched (the state needed for `auditFired` to be true
+    // AND for `allRealLanded` to be true so the gate opens). This
+    // mirrors how the production orchestrator surfaces an already-fired
+    // audit when the worker hasn't landed yet.
+    const now = new Date().toISOString();
+    const events = [
+      { ts: now, dispatcher: 'office', edge: 'real-1', status: 'dispatched', agent_id: 'm1', deps_at_dispatch: [] },
+      { ts: now, dispatcher: 'office', edge: 'real-1', status: 'landed', commit: 'real1aaa' },
+      { ts: now, dispatcher: 'office', edge: 'mu-mock-audit', status: 'dispatched', agent_id: 'm2', deps_at_dispatch: ['real-1'] },
+    ].map((e) => JSON.stringify(e)).join('\n') + '\n';
+    await writeFile(stateLogPath, events, 'utf8');
+
+    const result = await runOfficeAgentsPass({
+      issuesDir: dir,
+      stateLogPath,
+      dispatchFn: makeDispatchFn({ record: [] }),
+      options: { passNumber: 1 },
+    });
+
+    // Audit fired (via seeded log line) → final report was written.
+    assert.equal(result.reportWritten, true, 'report written for mu-mock-audit');
+    const reportPath = join(dir, '.afk-agents-report.md');
+    const report = await readFile(reportPath, 'utf8');
+    assert.match(report, /dispatcher: office/, 'report has office dispatcher frontmatter');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Bonus — script shape: zero-dep, exports runOfficeAgentsPass
 // ---------------------------------------------------------------------------
 

@@ -216,7 +216,8 @@ export async function runOfficeAgentsPass({
   // (if present) has been fired (status: dispatched OR landed).
   let reportWritten = false;
   if (writeFinalReport && allRealLanded(inFlight, slices, landedIds)) {
-    const auditFired = auditFiredInLog(logPath);
+    const auditSliceIds = auditSliceIdsFromSet(slices);
+    const auditFired = auditFiredInLog(logPath, auditSliceIds);
     if (auditFired) {
       writeReport({
         issuesDir: dir,
@@ -511,20 +512,35 @@ function stateLogLandedAt(logPath, edgeId) {
   return null;
 }
 
-function auditFiredInLog(logPath) {
+// Mirrors ready-edge.mjs:131 — an audit slice is any slice whose `mock: true`
+// AND whose title (trimmed, lowercased) starts with `mock:audit`. Detecting
+// audit by structural predicate (not id regex) keeps the audit detection
+// consistent across arbitrary slice-id naming schemes (e.g. `oa-mock-audit`,
+// `mu-mock-audit`, `audit-final-sweep`, etc.).
+function auditSliceIdsFromSet(slices) {
+  const ids = [];
+  for (const s of slices) {
+    if (!s) continue;
+    if (s.mock !== true) continue;
+    const title = (s.title ?? '').trim().toLowerCase();
+    if (title.startsWith('mock:audit')) ids.push(s.id);
+  }
+  return ids;
+}
+
+function auditFiredInLog(logPath, auditSliceIds) {
+  if (!auditSliceIds || auditSliceIds.length === 0) return false;
   if (!existsSync(logPath)) return false;
+  const idSet = new Set(auditSliceIds);
   const text = readFileSync(logPath, 'utf8');
   for (const raw of text.split(/\r?\n/).filter(Boolean)) {
     let evt;
     try { evt = JSON.parse(raw); }
     catch { continue; }
     if (!evt || evt.dispatcher !== 'office') continue;
-    if (evt.edge && /^oa-mock-audit|^mock-audit|^audit$/i.test(evt.edge)) {
-      if (evt.status === 'dispatched' || evt.status === 'landed') return true;
-    }
-    if (evt.edge && /^mock:audit/i.test(evt.edge)) {
-      if (evt.status === 'dispatched' || evt.status === 'landed') return true;
-    }
+    const edgeId = evt.edge ?? evt.slice_id;
+    if (!edgeId || !idSet.has(edgeId)) continue;
+    if (evt.status === 'dispatched' || evt.status === 'landed') return true;
   }
   return false;
 }
