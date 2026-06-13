@@ -13,13 +13,14 @@
 --   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 --   last_seen    TIMESTAMPTZ NOT NULL DEFAULT now()
 --
--- pdf_slug is per-user unique via ON CONFLICT (pdf_slug) DO UPDATE —
--- so a second hit on the same slug re-uses the row (last_seen bump)
--- rather than erroring out. The composite semantics is "every (slug,
--- user_id) pair is unique; if you see a slug that already exists for
--- this user, just touch it." In practice `users` mint unique ids so
--- the global uniqueness is fine; a same-slug retry from the same
--- user hits the ON CONFLICT path, which is the desired behaviour.
+-- pdf_slug is per-user unique via the composite PRIMARY KEY (user_id,
+-- pdf_slug) — so a second hit on the same slug from the SAME user
+-- re-uses the row (ON CONFLICT (user_id, pdf_slug) DO UPDATE bumps
+-- last_seen) rather than erroring out. The composite semantics is
+-- "every (slug, user_id) pair is unique; if you see a slug that
+-- already exists for this user, just touch it." Two different users
+-- may legitimately pick the same slug — those rows coexist under the
+-- composite PK without overwriting each other.
 --
 -- Used for:
 --   - admin stats endpoint (US-1.4) — counts per user
@@ -29,14 +30,15 @@
 -- Idempotent. Safe to re-apply.
 
 CREATE TABLE IF NOT EXISTS pdf_jobs (
-  pdf_slug     TEXT         PRIMARY KEY,
+  pdf_slug     TEXT         NOT NULL,
   user_id      TEXT         NOT NULL,
   kind         TEXT         NOT NULL,
   source       TEXT         NOT NULL,
   oss_key      TEXT         NULL,
   size_bytes   BIGINT       NULL,
   created_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
-  last_seen    TIMESTAMPTZ  NOT NULL DEFAULT now()
+  last_seen    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, pdf_slug)
 );
 
 -- Hot path lookup is `(user_id, slug)` → row, used by handlePdfOss on
