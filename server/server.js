@@ -1139,15 +1139,16 @@ setInterval(() => {
 
 // mu-006: recordPdfJob — best-effort INSERT into pdf_jobs on every successful
 // PDF render. Mirrors recordRun's "log-on-failure" contract so a DB outage
-// never breaks the /pdf response. ON CONFLICT (pdf_slug) DO UPDATE bumps
-// last_seen for retry hits of the same slug from the same user.
+// never breaks the /pdf response. ON CONFLICT (user_id, pdf_slug) DO UPDATE
+// bumps last_seen for retry hits of the same (slug, user) pair — matches the
+// composite PRIMARY KEY in migrations/006_pdf_jobs.sql (bug-007 + bug-012).
 async function recordPdfJob(row) {
   if (!pgPool) return;
   try {
     await pgPool.query(
       `INSERT INTO pdf_jobs (pdf_slug, user_id, kind, source, oss_key, size_bytes, created_at, last_seen)
        VALUES ($1,$2,$3,$4,$5,$6, now(), now())
-       ON CONFLICT (pdf_slug) DO UPDATE
+       ON CONFLICT (user_id, pdf_slug) DO UPDATE
          SET last_seen = now(),
              oss_key   = COALESCE(EXCLUDED.oss_key, pdf_jobs.oss_key),
              size_bytes= COALESCE(EXCLUDED.size_bytes, pdf_jobs.size_bytes),
