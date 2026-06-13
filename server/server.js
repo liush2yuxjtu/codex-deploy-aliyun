@@ -1945,6 +1945,14 @@ async function handleRunAsync(req, res) {
 
   let spawn;
   try {
+    spawn = startCodexJob({
+      prompt: effectivePrompt,
+      effectiveKey,
+      effectiveModel,
+      timeoutS,
+      clientIp,
+      sessionId,
+    });
   } catch (e) {
     job.state = 'error';
     job.error = String(e && e.message || e);
