@@ -9,8 +9,7 @@ mock: true
 mock_refines:
   - 2
   - 3
-blocked_by:
-  - mu-001
+blocked_by: [mu-001]
 triage: ready-for-agent
 status: pending
 ---

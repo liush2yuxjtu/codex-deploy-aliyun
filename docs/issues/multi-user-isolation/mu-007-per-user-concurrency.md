@@ -6,10 +6,7 @@ parallel_group: M-W3B
 type: AFK
 round: 3
 mock: false
-blocked_by:
-  - mu-001
-  - mu-002
-  - mu-003
+blocked_by: [mu-001, mu-002, mu-003]
 files:
   - server/server.js
 risk: medium

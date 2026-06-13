@@ -6,14 +6,7 @@ parallel_group: M-W4
 type: AFK
 round: 4
 mock: false
-blocked_by:
-  - mu-001
-  - mu-002
-  - mu-003
-  - mu-004
-  - mu-005
-  - mu-006
-  - mu-007
+blocked_by: [mu-001, mu-002, mu-003, mu-004, mu-005, mu-006, mu-007]
 files:
   - frontend/index.html
 risk: low

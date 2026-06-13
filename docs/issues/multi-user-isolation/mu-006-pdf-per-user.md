@@ -6,8 +6,7 @@ parallel_group: M-W2B
 type: AFK
 round: 2
 mock: false
-blocked_by:
-  - mu-001
+blocked_by: [mu-001]
 files:
   - migrations/006_pdf_jobs.sql
   - server/server.js

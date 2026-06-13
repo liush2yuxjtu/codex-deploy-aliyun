@@ -6,8 +6,7 @@ parallel_group: M-W2A
 type: AFK
 round: 2
 mock: false
-blocked_by:
-  - mu-001
+blocked_by: [mu-001]
 files:
   - migrations/004_codex_runs_user_id.sql
   - server/server.js

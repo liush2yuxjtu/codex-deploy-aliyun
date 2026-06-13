@@ -19,8 +19,7 @@ mocks:
   - mu-mock-002
   - mu-mock-003
   - mu-mock-004
-blocked_by:
-  - mu-008
+blocked_by: [mu-008]
 files:
   - server/
   - migrations/
