@@ -121,11 +121,10 @@ rotate_ak() {
   log "rotate AK: would call ram CreateAccessKey + Disable older"
   log "  current ALIBABA_CLOUD_ACCESS_KEY_ID length=${#ALIBABA_CLOUD_ACCESS_KEY_ID}"
   if [ "$MODE" = "apply" ]; then
-    local kid ksec
-    kid=$("$AL" ram CreateAccessKey --region "$ALIYUN_REGION" \
-      | python3 -c "import json,sys;print(json.load(sys.stdin)['AccessKey']['AccessKeyId'])")
-    ksec=$("$AL" ram CreateAccessKey --region "$ALIYUN_REGION" \
-      | python3 -c "import json,sys;print(json.load(sys.stdin)['AccessKey']['AccessKeySecret'])")
+    local create_resp kid ksec
+    create_resp=$("$AL" ram CreateAccessKey --region "$ALIYUN_REGION")
+    kid=$(printf '%s' "$create_resp" | python3 -c "import json,sys;print(json.load(sys.stdin)['AccessKey']['AccessKeyId'])")
+    ksec=$(printf '%s' "$create_resp" | python3 -c "import json,sys;print(json.load(sys.stdin)['AccessKey']['AccessKeySecret'])")
     [ -n "$kid" ] && [ -n "$ksec" ] || { log "CreateAccessKey returned empty"; return 1; }
     log "  new AK id length=${#kid} secret length=${#ksec}"
     "$AL" ram UpdateAccessKeyStatus --region "$ALIYUN_REGION" \
