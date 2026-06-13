@@ -72,6 +72,28 @@ psql_run() {
       -v ON_ERROR_STOP=1 -A -t -c "$1"
   fi
 }
+# Parameterised variant: pass a SQL with :'name' / :'md5' placeholders
+# and bind them via psql -v so the values are escaped server-side.
+# Usage: psql_run_vars "<SQL>" <name_value> <md5_value>
+psql_run_vars() {
+  local sql="$1" name_val="$2" md5_val="$3"
+  if [[ "$USE_SSH" -eq 1 ]]; then
+    # Over SSH: pipe the SQL on stdin, but psql -v variables must be
+    # passed on the *command line* (stdin -v is not a thing). The
+    # values ride on the ssh cmd line; they are still psql-escaped
+    # when the SQL references :'name' / :'md5', so the SQL-injection
+    # risk is contained.
+    ssh -i "$SSH_KEY" "root@$SERVER_IP" PGPASSWORD="$RDS_PASSWORD" psql \
+      -h "$RDS_HOST" -p "$RDS_PORT" -U "$RDS_USER" -d "$RDS_DB" \
+      -v ON_ERROR_STOP=1 -A -t \
+      -v "name=${name_val}" -v "md5=${md5_val}" <<< "$sql"
+  else
+    PGPASSWORD="$RDS_PASSWORD" psql \
+      -h "$RDS_HOST" -p "$RDS_PORT" -U "$RDS_USER" -d "$RDS_DB" \
+      -v ON_ERROR_STOP=1 -A -t -c "$sql" \
+      -v "name=${name_val}" -v "md5=${md5_val}"
+  fi
+}
 psql_run_file() {
   if [[ "$USE_SSH" -eq 1 ]]; then
     # Stream the local file over ssh; remote psql reads it from stdin.
@@ -154,7 +176,7 @@ while IFS= read -r name; do
   md5="$(md5_of_file "$path")"
   echo "  → $name (md5=$md5)"
   psql_run_file "$path"
-  psql_run "INSERT INTO _migrations(name, md5) VALUES ('$name', '$md5');" >/dev/null
+  psql_run_vars "INSERT INTO _migrations(name, md5) VALUES (:'name', :'md5');" "$name" "$md5" >/dev/null
 done <<< "$pending"
 
 echo "[rds-migrate] done"
