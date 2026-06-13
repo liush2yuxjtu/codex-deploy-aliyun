@@ -32,6 +32,32 @@ at the end of the day" piles.
 - CI / preview deploys that depend on the remote should see every commit, not
   just the last one of the session.
 
+### 3. Follow-ups → spawn subagents, never prompt
+
+When a follow-up task surfaces on this project (in a final report's
+"## Follow-ups" section, in a slice's "## Ambiguities resolved →
+Punted to follow-ups", in a handoff doc, or anywhere a worker wrote
+"filed for follow-up"), the agent **MUST NOT** prompt the user with an
+AskUserQuestion to choose "now vs hold". Default behavior: spawn one
+non-blocking subagent per follow-up via the Agent tool
+(`subagent_type: "general-purpose"`, `run_in_background: true`), in
+parallel, and report results as they land.
+
+- Each follow-up subagent gets a focused scope prompt: exact files in
+scope, hard rules (atomic commit + push, no sub-spawn, no user
+questions), verification step (run the relevant test), 2-3 line
+report shape.
+- Track each dispatched follow-up with TaskCreate so the parent can
+re-flip status on landed notifications.
+- One exception — true irreversible decisions (delete files, drop a
+public API/CLI flag, break a dep contract, > 1 h worker time): surface
+as an AskUserQuestion. Everything else (small bug fix, refactor, test
+addition, copy-publish, fixture retyping) is fire-and-forget.
+- Pairs with `feedback-default-e2e-fix.md` (fix on the spot, don't
+defer), `feedback-always-deploy-immediately.md` (push after every
+commit), and `feedback-mocks-not-stuck.md` (mock + move on, don't
+gate).
+
 ## Current state (2026-06-11)
 
 - Repo has no commits on `main` and **no git remote configured** — rule #2
