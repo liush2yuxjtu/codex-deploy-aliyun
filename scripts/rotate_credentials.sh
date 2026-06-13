@@ -53,7 +53,7 @@ do_rollback() {
   log "rollback: scp $src/server-env -> ${SERVER_TARGET:-server}:$SERVER_ENV"
   scp -i "$SSH_KEY" "$src/server-env" "$SSH_TARGET:$SERVER_ENV.new"
   ssh -i "$SSH_KEY" "$SSH_TARGET" "mv $SERVER_ENV.new $SERVER_ENV && systemctl restart codex-api.service"
-  curl -fsS "$HEALTHZ_URL" | grep -q '"db.ok":true' && log "rollback: healthz ok" || { log "rollback: healthz FAILED"; exit 1; }
+  curl -fsS "$HEALTHZ_URL" | jq -e '.db.ok == true' >/dev/null && log "rollback: healthz ok" || { log "rollback: healthz FAILED"; exit 1; }
   log "rollback complete"
   exit 0
 }
@@ -70,7 +70,7 @@ esac
 # shellcheck disable=SC1090
 [ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE" >&2; exit 1; }
 set -a; . "$ENV_FILE"; set +a
-need aliyun; need ssh; need scp; need curl; need ssh-keygen
+need aliyun; need ssh; need scp; need curl; need ssh-keygen; need jq
 
 # ─── backup current state ────────────────────────────────────────────────────
 TS="$(date -u +%Y-%m-%dT%H%M%SZ)"
@@ -174,7 +174,7 @@ if [ "$MODE" = "apply" ]; then
   ssh -i "$SSH_KEY" "$SSH_TARGET" \
     "mv $SERVER_ENV.new $SERVER_ENV && systemctl restart codex-api.service"
   log "checking $HEALTHZ_URL"
-  if curl -fsS "$HEALTHZ_URL" | grep -q '"db.ok":true'; then
+  if curl -fsS "$HEALTHZ_URL" | jq -e '.db.ok == true' >/dev/null; then
     log "healthz ok: db.live"
   else
     log "healthz FAILED — manual review at $BAK"
