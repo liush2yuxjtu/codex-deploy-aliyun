@@ -20,7 +20,15 @@ status: pending
 
 Typed contract stub for the `ready-edge.mjs` script that oa-002 will implement. Lets the oa-005 orchestrator agent (wave 3) start writing the orchestration in wave 1 without waiting on oa-002.
 
-## Mock contract surface
+## Mock contract surface — realized by oa-002
+
+This mock contract was realized by `oa-002` on 2026-06-13T00:20:41Z (commits `c64849d` + `356cc67` + `6208080`). The real implementation lives at:
+
+- `plugins/office-agents/skills/office-agents/scripts/ready-edge.mjs`
+
+Downstream consumers (oa-005 orchestrator) should switch their imports from this mock to the real `ready-edge.mjs` module. See `oa-002-ready-edge-script.md` for the implementation report.
+
+### Reference: original typed contract (kept for audit)
 
 - **CLI shape** (target):
   ```

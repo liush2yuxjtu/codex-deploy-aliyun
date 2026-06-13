@@ -21,7 +21,15 @@ status: pending
 
 Typed contract stub for the streaming stdout + final report that oa-005's orchestrator will implement. Lets the user (and any e2e test in oa-007) start reasoning about the user-facing output shape in wave 1 without waiting on oa-005.
 
-## Mock contract surface
+## Mock contract surface — realized by oa-005
+
+This mock contract was realized by `oa-005` on 2026-06-13T00:31:58Z (commits `5fd163a` + `8f50338` + `1bc1ec2`). The real implementation lives at:
+
+- `plugins/office-agents/skills/office-agents/scripts/orchestrate.mjs`
+
+Downstream consumers (oa-006 audit, oa-007 e2e) should switch their expectations from this mock to the real `orchestrate.mjs` script. See `oa-005-triage-stdout-report.md` for the implementation report.
+
+### Reference: original typed contract (kept for audit)
 
 - **Per-invocation stdout shape** (per US-1.4 — streaming, no `open`/pop-open, no fork-spawned window):
   ```

@@ -20,7 +20,15 @@ status: pending
 
 Typed contract stub for the `dispatch.mjs` script that oa-004 will implement. Lets the oa-005 orchestrator agent (wave 3) start wiring the dispatch into the orchestration in wave 1 without waiting on oa-004.
 
-## Mock contract surface
+## Mock contract surface — realized by oa-004
+
+This mock contract was realized by `oa-004` on 2026-06-13T00:18:54Z (commits `78beb4e` + `b741f9f` + `56d98a9`). The real implementation lives at:
+
+- `plugins/office-agents/skills/office-agents/scripts/dispatch.mjs`
+
+Downstream consumers (oa-005 orchestrator) should switch their imports from this mock to the real `dispatch.mjs` module. See `oa-004-dispatcher-and-prompt-builder.md` for the implementation report.
+
+### Reference: original typed contract (kept for audit)
 
 - **Two exported functions** (target):
   - `buildWorkerPrompt(slicePath)`: reads the slice's `.md`, extracts `## What to build` + `## Acceptance criteria`, constructs the full prompt body. The body mirrors the `/afk-agents` worker template (per AP-4 — do NOT modify the worker prompt template between /afk-agents and /office-agents) with one office-agents-specific preamble: `"You are dispatched via the office-agents event-driven dispatcher. Your slice is ready because all upstream deps have landed. State log entry: <edge>: dispatched via office-agents."`

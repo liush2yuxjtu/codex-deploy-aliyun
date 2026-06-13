@@ -20,7 +20,15 @@ status: pending
 
 Typed contract stub for the `mock-gen.mjs` script that oa-003 will implement. Lets the oa-005 orchestrator agent (wave 3) start writing the mock refinement logic in wave 1 without waiting on oa-003.
 
-## Mock contract surface
+## Mock contract surface — realized by oa-003
+
+This mock contract was realized by `oa-003` on 2026-06-13T00:18:38Z (commits `481e681` + `c3883f0`). The real implementation lives at:
+
+- `plugins/office-agents/skills/office-agents/scripts/mock-gen.mjs`
+
+Downstream consumers (oa-005 orchestrator) should switch their imports from this mock to the real `mock-gen.mjs` module. See `oa-003-mock-upfront-and-refine.md` for the implementation report.
+
+### Reference: original typed contract (kept for audit)
 
 - **Two exported functions** (target):
   - `generateUpfrontMocks(sliceSet, issuesDir)`: writes a `.md` stub for every `mock: true` slice in `sliceSet` whose file doesn't exist yet in `issuesDir`. Idempotent (re-running does not overwrite).

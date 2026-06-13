@@ -18,10 +18,11 @@ effort: medium
 expected_commits: 2
 ready_for_agent: true
 status: pending
-triage: in-progress
+triage: in-review
 ---
 
 <!-- office-agents: dispatched at 2026-06-13T00:20:41Z via ready-edge=oa-002,oa-003,oa-004 (all landed) -->
+<!-- office-agents: landed at 2026-06-13T00:31:58Z (commits 5fd163a + 8f50338 + 1bc1ec2) -->
 
 # oa-005: orchestrator — combine 002+003+004 into the full /office-agents loop
 

@@ -16,10 +16,11 @@ effort: medium
 expected_commits: 2
 ready_for_agent: true
 status: pending
-triage: in-progress
+triage: in-review
 ---
 
 <!-- office-agents: dispatched at 2026-06-13T00:14:25Z via ready-edge=oa-001 -->
+<!-- office-agents: landed at 2026-06-13T00:18:54Z (commits 78beb4e + b741f9f + 56d98a9) -->
 
 # oa-004: per-edge dispatcher + worker prompt builder
 

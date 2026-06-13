@@ -25,10 +25,11 @@ effort: small
 expected_commits: 1
 ready_for_agent: true
 status: done
-triage: in-progress
+triage: in-review
 ---
 
 <!-- office-agents: dispatched at 2026-06-13T00:31:58Z via ready-edge=oa-001+oa-002+oa-003+oa-004+oa-005 (auditReady=true) -->
+<!-- office-agents: landed at 2026-06-13T00:35:15Z (commit 3a3d40e) — ship-gate verdict: PASS -->
 
 # oa-006: mock:audit ship gate — 4 rg sweeps for office-agents
 

@@ -15,10 +15,11 @@ effort: medium
 expected_commits: 1
 ready_for_agent: true
 status: pending
-triage: in-progress
+triage: in-review
 ---
 
 <!-- office-agents: dispatched at 2026-06-13T00:35:15Z via ready-edge=oa-006 (ship-gate PASS) -->
+<!-- office-agents: landed at 2026-06-13T00:54:51Z (commits 0aa223d + e5a8514) — e2e: 5s wall-clock vs /afk-agents 40 min = 0.2% of baseline — SC-7 PASS -->
 
 # oa-007: e2e — /office-agents against the multi-user-isolation wave plan
 

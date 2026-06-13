@@ -16,10 +16,11 @@ effort: medium
 expected_commits: 2
 ready_for_agent: true
 status: pending
-triage: in-progress
+triage: in-review
 ---
 
 <!-- office-agents: dispatched at 2026-06-13T00:14:25Z via ready-edge=oa-001 -->
+<!-- office-agents: landed at 2026-06-13T00:20:41Z (commits c64849d + 356cc67 + 6208080) -->
 
 # oa-002: ready-edge.mjs — compute ready edges from slice set + state log
 
